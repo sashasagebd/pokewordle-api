@@ -87,8 +87,9 @@ Postgres.
    the tables and loads the Pokémon. Until the database answers, the app
    doesn't listen, so a deploy without one fails its health check instead of
    going live broken.
-3. Make it public (**Public access**, name `api`), so it's served at
-   `https://api.<PUBLIC_DOMAIN>`.
+3. Make it public (**Public access**, name `pokewordle-api`), so it's served
+   at `https://pokewordle-api.<PUBLIC_DOMAIN>`. The frontend's API URL
+   points there, so renaming it means updating the frontend too.
 
 Pushes to `main` deploy automatically.
 
