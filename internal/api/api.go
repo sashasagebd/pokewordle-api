@@ -23,7 +23,7 @@ type Pokedex interface {
 }
 
 // New returns the API's handler. allowedOrigins are the browser origins that
-// may call it (CORS), e.g. "https://pokewordle.sashasagebd.workers.dev".
+// may call it (CORS), e.g. "https://pokewordle.sashasagebd.com".
 func New(dex Pokedex, allowedOrigins []string) http.Handler {
 	mux := http.NewServeMux()
 

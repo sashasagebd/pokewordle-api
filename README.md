@@ -69,7 +69,7 @@ Postgres.
 | Variable | Default | What |
 |---|---|---|
 | `DATABASE_URL` | required | Set by the platform once the app has a database. |
-| `ALLOWED_ORIGINS` | `https://pokewordle.sashasagebd.workers.dev,http://localhost:5173` | Browser origins allowed to call the API (CORS), comma-separated. |
+| `ALLOWED_ORIGINS` | `https://pokewordle.sashasagebd.com,https://pokewordle.sashasagebd.workers.dev,http://localhost:5173` | Browser origins allowed to call the API (CORS), comma-separated. |
 | `PORT` | `8080` | Port to listen on. |
 
 ## Deploying on the platform

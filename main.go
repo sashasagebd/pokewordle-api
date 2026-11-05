@@ -22,7 +22,7 @@ import (
 	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
 )
 
-const defaultOrigins = "https://pokewordle.sashasagebd.workers.dev,http://localhost:5173"
+const defaultOrigins = "https://pokewordle.sashasagebd.com,https://pokewordle.sashasagebd.workers.dev,http://localhost:5173"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
