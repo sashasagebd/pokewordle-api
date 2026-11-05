@@ -1,6 +1,6 @@
 // Command pokewordle-api is the backend for pokewordle. It serves Pokémon
-// data from its own Postgres (seeded from a file embedded in the binary) and,
-// in later phases, runs the games server-side so scores can't be faked.
+// data from its own Postgres (seeded from a file embedded in the binary) and
+// runs the games server-side, so scores can't be faked.
 //
 // It runs on the ops-dashboard platform: port 8080, health check /healthz,
 // DATABASE_URL from the app's database.
@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/sashasagebd/pokewordle-api/internal/api"
+	"github.com/sashasagebd/pokewordle-api/internal/auth"
 	"github.com/sashasagebd/pokewordle-api/internal/db"
+	"github.com/sashasagebd/pokewordle-api/internal/games"
 	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
 )
 
@@ -40,6 +42,9 @@ func run() error {
 	seed, err := pokedex.Seed()
 	if err != nil {
 		return err // a bad seed file is a build mistake; never start with it
+	}
+	if err := pokedex.CheckSprites(); err != nil {
+		return err // likewise
 	}
 
 	pool, err := db.Open(ctx, os.Getenv("DATABASE_URL"))
@@ -69,8 +74,14 @@ func run() error {
 
 	addr := ":" + envOr("PORT", "8080")
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           api.New(dex, splitList(envOr("ALLOWED_ORIGINS", defaultOrigins))),
+		Addr: addr,
+		Handler: api.New(api.Config{
+			Dex:            dex,
+			Players:        auth.NewStore(pool),
+			Games:          games.NewStore(pool, &games.Engine{Dex: games.NewDex(seed)}),
+			Silhouette:     pokedex.Silhouette,
+			AllowedOrigins: splitList(envOr("ALLOWED_ORIGINS", defaultOrigins)),
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,

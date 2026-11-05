@@ -22,10 +22,22 @@ type Pokedex interface {
 	Ping(ctx context.Context) error
 }
 
-// New returns the API's handler. allowedOrigins are the browser origins that
-// may call it (CORS), e.g. "https://pokewordle.sashasagebd.com".
-func New(dex Pokedex, allowedOrigins []string) http.Handler {
+// Config is what the API is built from.
+type Config struct {
+	Dex     Pokedex
+	Players Players
+	Games   Games
+	// Silhouette renders a Pokémon's silhouette (pokedex.Silhouette).
+	Silhouette func(id int) ([]byte, error)
+	// AllowedOrigins are the browser origins that may call the API (CORS),
+	// e.g. "https://pokewordle.sashasagebd.com".
+	AllowedOrigins []string
+}
+
+// New returns the API's handler.
+func New(c Config) http.Handler {
 	mux := http.NewServeMux()
+	dex := c.Dex
 
 	// The platform's health check: the app is up and its database answers.
 	// A version that can't reach the database never goes live.
@@ -71,7 +83,8 @@ func New(dex Pokedex, allowedOrigins []string) http.Handler {
 		writeJSON(w, http.StatusOK, p)
 	})
 
-	return cors(allowedOrigins, mux)
+	gameRoutes(mux, c)
+	return cors(c.AllowedOrigins, mux)
 }
 
 // parseGens reads a comma-separated list of generation numbers (1 to 9).

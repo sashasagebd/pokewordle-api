@@ -11,9 +11,9 @@ platform-managed Postgres, and is public through Cloudflare Tunnel.
 ## Status
 
 - [x] **Phase 1:** Pokémon data in Postgres, `GET /pokemon`, health check, deploy
-- [ ] **Phase 2:** anonymous players and server-side games (the server holds the answer)
+- [x] **Phase 2:** anonymous players, server-side games (the server holds the answer), Who's That silhouettes
 - [ ] **Phase 3:** usernames and leaderboards
-- [ ] **Phase 4:** silhouette images, rate limits, cleanup of old games
+- [ ] **Phase 4:** rate limits, cleanup of old games and players
 
 ## API
 
@@ -32,19 +32,75 @@ PokéAPI's units):
 
 Errors are `{"error": "..."}` with a 4xx or 5xx status.
 
+### Games
+
+The server holds every answer and shows only what the player has earned, so
+a game's score is what was actually played. (It can't stop someone looking
+Pokémon up, or a bot: in Higher or Lower the next Pokémon's name is shown, and
+`/pokemon` is public.)
+
+Players are anonymous. `POST /players` returns `{"token": "..."}`, sent from
+then on as `Authorization: Bearer <token>`. Only its sha256 is stored, so a
+lost token can't be recovered: the frontend just gets a new one. A missing or
+unknown token is a 401. Game responses are `Cache-Control: no-store`.
+
+| Request | Answer |
+|---|---|
+| `POST /players` | `{"token": "..."}` (201) |
+| `POST /games` `{"mode", "gens": [1, 2]}` | A new game (201). Modes: `wordle`, `higher_lower`, `whos_that`. No `gens` means all. Abandons the player's game of that mode in progress. |
+| `GET /games/{id}` | The game as the player may see it, e.g. to pick it up after a reload. |
+| `POST /games/{id}/guess` `{"name"}` | Wordle: `{"result": comparison, "game": game}`. |
+| `POST /games/{id}/answer` `{"n", "dir", "stat"}` or `{"n", "name"}` | Higher or Lower (`dir` `higher`/`lower`, `stat` `height`/`weight`) or Who's That: `{"correct", "answer": Pokémon, "game": game}`. |
+| `POST /games/{id}/give-up` | Ends the game as lost and reveals the answer. |
+| `GET /games/{id}/rounds/{n}/image` | Who's That: round `n`'s silhouette (PNG), for the open round and the one after it (to preload). |
+
+A game:
+
+```json
+{"id": "…", "mode": "higher_lower", "gens": [1], "status": "active", "score": 3,
+ "round": {"n": 4, "current": {"id": 25, "name": "pikachu", "...": "…"},
+           "next": {"id": 6, "name": "charizard"}, "upcoming": {"id": 81, "name": "magnemite"}}}
+```
+
+- `status` is `active`, `won` (Wordle), `lost` (a wrong answer, or giving up) or `abandoned`.
+- `score` is the number of guesses in Wordle and the streak in the others.
+- `round` (streak modes, while active): Higher or Lower shows `current` with its
+  values and `next` by name only. `upcoming` is the Pokémon after `next`, for
+  preloading. Who's That shows only `n`.
+- `guesses` (Wordle) lists the comparisons so far, oldest first.
+- `answer` is the Pokémon revealed once the game is over.
+
+A Wordle comparison, `{"guess": Pokémon, "height", "weight", "type", "correct"}`:
+`height` and `weight` say where the answer is relative to the guess
+(`higher`, `lower`, `equal`). `type` compares first types: `same`, `effective`
+(the guess's type is super effective against the answer's), `weak` (the
+reverse) or `neutral`.
+
+Mistakes that don't count as a move are 400s with a message for the player
+(an unknown Pokémon, one outside the game's generations, a repeated guess).
+Moves on a finished game are 409. Answers carry the round `n` they answer:
+answering a round that's already been answered (a retried request) is a 409
+with the game as it is now, `{"error", "game"}`, so the frontend can catch up.
+Someone else's game is a 404, the same as a missing one.
+
 ## Pokémon data
 
 The data lives in [internal/pokedex/pokemon.json](internal/pokedex/pokemon.json),
 which is embedded in the binary and loaded into the `pokemon` table on every
-start (rows that already match are left alone). The API never calls PokéAPI
-itself. To refresh the file from PokéAPI, then review the diff and commit it:
+start (rows that already match are left alone). The sprites Who's That makes
+silhouettes from are in [internal/pokedex/sprites/](internal/pokedex/sprites/)
+(PokéAPI's default sprites, about 3 MB), also embedded. The API never calls
+PokéAPI itself. To refresh them, then review the diff and commit it:
 
 ```sh
-go run ./cmd/genseed
+go run ./cmd/genseed               # both
+go run ./cmd/genseed -only data    # just pokemon.json
+go run ./cmd/genseed -only sprites # just the sprites
 ```
 
 It checks the data before writing it (all 1,025 Pokémon, generations matching
-the dex ranges, one or two known types), and so does the API at startup.
+the dex ranges, one or two known types, sprites that decode), and so does the
+API at startup.
 
 ## Running it locally
 
