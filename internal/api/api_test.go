@@ -48,7 +48,7 @@ func newTestAPI(dex *fakeDex) http.Handler {
 			{ID: 152, Name: "chikorita", Generation: 2, Height: 9, Weight: 64, Types: []string{"grass"}},
 		}}
 	}
-	return New(dex, []string{frontend})
+	return New(Config{Dex: dex, Players: newFakePlayers(), Games: newFakeGames(), Silhouette: pokedex.Silhouette, AllowedOrigins: []string{frontend}})
 }
 
 func do(h http.Handler, method, target string, header map[string]string) *httptest.ResponseRecorder {
