@@ -24,9 +24,12 @@ func TestStore(t *testing.T) {
 		t.Fatalf("second Load changed %d rows (err %v), want 0", n, err)
 	}
 
-	all, err := s.List(ctx, nil)
-	if err != nil || len(all) != pokedex.Count {
-		t.Fatalf("List(all) = %d Pokémon (err %v), want %d", len(all), err, pokedex.Count)
+	// nil (what the API passes without ?gens) and empty both mean all.
+	for _, gens := range [][]int{nil, {}} {
+		all, err := s.List(ctx, gens)
+		if err != nil || len(all) != pokedex.Count {
+			t.Fatalf("List(%#v) = %d Pokémon (err %v), want %d", gens, len(all), err, pokedex.Count)
+		}
 	}
 	gen1and9, err := s.List(ctx, []int{1, 9})
 	if err != nil {

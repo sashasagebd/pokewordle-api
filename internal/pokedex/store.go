@@ -57,9 +57,11 @@ func (s *Store) Load(ctx context.Context, ps []Pokemon) (changed int64, err erro
 // List returns the Pokémon of the given generations (1 to 9) in dex order,
 // or all of them if gens is empty.
 func (s *Store) List(ctx context.Context, gens []int) ([]Pokemon, error) {
+	// pgx sends a nil slice as NULL, not an empty array, and
+	// cardinality(NULL) is NULL rather than 0: hence the coalesce.
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, generation, height, weight, types FROM pokemon
-		WHERE cardinality($1::int[]) = 0 OR generation = ANY($1)
+		WHERE coalesce(cardinality($1::int[]), 0) = 0 OR generation = ANY($1)
 		ORDER BY id`, gens)
 	if err != nil {
 		return nil, err
