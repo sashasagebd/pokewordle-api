@@ -1,0 +1,4 @@
+/pokewordle-api
+/pokewordle-api.exe
+*.test
+.env
