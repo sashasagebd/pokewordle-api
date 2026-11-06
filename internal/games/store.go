@@ -143,6 +143,11 @@ func (s *Store) move(ctx context.Context, player, id string, play func(*Game) (*
 			g.ID, g.Status, g.Score); err != nil {
 			return err
 		}
+		if improvesBest(g, answered) {
+			if err := recordBest(ctx, tx, player, g); err != nil {
+				return err
+			}
+		}
 		st = s.engine.State(g)
 		return nil
 	})

@@ -12,8 +12,8 @@ platform-managed Postgres, and is public through Cloudflare Tunnel.
 
 - [x] **Phase 1:** Pokémon data in Postgres, `GET /pokemon`, health check, deploy
 - [x] **Phase 2:** anonymous players, server-side games (the server holds the answer), Who's That silhouettes
-- [ ] **Phase 3:** usernames and leaderboards
-- [ ] **Phase 4:** rate limits, cleanup of old games and players
+- [x] **Phase 3:** usernames (argon2id), best scores, leaderboards
+- [ ] **Phase 4:** rate limits for the whole API, cleanup of old games and players
 
 ## API
 
@@ -82,6 +82,30 @@ Moves on a finished game are 409. Answers carry the round `n` they answer:
 answering a round that's already been answered (a retried request) is a 409
 with the game as it is now, `{"error", "game"}`, so the frontend can catch up.
 Someone else's game is a 404, the same as a missing one.
+
+### Accounts and leaderboards
+
+A guest can claim a username and password, keeping everything they've played,
+and log in with them on another device for a new token to the same player.
+Logging in with a guest's token merges the guest into the account: its games
+move over, each best score keeps whichever is better, and the guest is
+deleted. Passwords are hashed with argon2id (19 MiB, 2 passes, at most 2
+hashes at a time to stay inside the container's memory). The two password
+endpoints allow 10 tries a minute per IP (`CF-Connecting-IP`), and answer 429
+past that.
+
+| Request | Answer |
+|---|---|
+| `GET /me` | `{"username": null or "...", "best": [{"mode", "gens", "best", "gameId", "achievedAt"}]}` |
+| `POST /me/username` `{"username", "password"}` | Claims a name: 3 to 20 letters, digits, `_` or `-`, unique ignoring case. Passwords are 8 to 128 characters. 409 if it's taken or the player already has one. |
+| `POST /sessions` `{"username", "password"}` | Logs in: `{"token", "username"}` (201). 401 for a wrong name or password, without saying which. Merges the guest if sent with a guest's token. |
+| `DELETE /sessions/current` | Logs out: the token stops working (204). |
+| `GET /leaderboard?mode=&gens=1,2&limit=20` | `{"entries": [{"rank", "username", "best", "achievedAt"}], "me": {"rank", "best"}}`. Named players only. `me` comes with a token, when the player has a best on that board; its `rank` is null for a guest. Cached for 30s without a token. |
+
+A best score is per mode and exact set of generations: the fewest guesses in
+a won Wordle, the longest streak otherwise. Streaks count as they grow, in the
+same transaction as the right answer, and a best only ever improves. Ties go
+to whoever got there first.
 
 ## Pokémon data
 
