@@ -14,11 +14,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sashasagebd/pokewordle-api/internal/api"
 	"github.com/sashasagebd/pokewordle-api/internal/auth"
+	"github.com/sashasagebd/pokewordle-api/internal/cleanup"
 	"github.com/sashasagebd/pokewordle-api/internal/db"
 	"github.com/sashasagebd/pokewordle-api/internal/games"
 	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
@@ -71,6 +73,14 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+
+	// Tidies the database hourly, starting a few minutes in (so a deploy's
+	// two versions don't both start on it; the lock decides anyway). It stops
+	// with ctx, before the pool closes.
+	var background sync.WaitGroup
+	defer background.Wait()
+	defer stop() // runs first: however run returns, the background work ends
+	background.Go(func() { cleanup.Run(ctx, pool, cleanup.Defaults, 3*time.Minute, time.Hour) })
 
 	addr := ":" + envOr("PORT", "8080")
 	srv := &http.Server{
