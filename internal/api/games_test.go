@@ -19,11 +19,15 @@ import (
 
 // fakePlayers hands out tokens from memory.
 type fakePlayers struct {
-	mu      sync.Mutex
-	players map[string]string // token → player
+	mu        sync.Mutex
+	players   map[string]string // token → player
+	names     map[string]string // player → username
+	passwords map[string]string // username → password
 }
 
-func newFakePlayers() *fakePlayers { return &fakePlayers{players: map[string]string{}} }
+func newFakePlayers() *fakePlayers {
+	return &fakePlayers{players: map[string]string{}, names: map[string]string{}, passwords: map[string]string{}}
+}
 
 func (f *fakePlayers) NewPlayer(context.Context) (string, string, error) {
 	f.mu.Lock()
@@ -49,6 +53,8 @@ type fakeGames struct {
 	engine *games.Engine
 	games  map[string]*games.Game
 	owner  map[string]string
+	merges [][2]string // from, to
+	boards []string    // the player each Leaderboard call was for
 }
 
 func newFakeGames() *fakeGames {

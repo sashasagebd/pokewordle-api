@@ -84,6 +84,7 @@ func New(c Config) http.Handler {
 	})
 
 	gameRoutes(mux, c)
+	accountRoutes(mux, c)
 	return cors(c.AllowedOrigins, mux)
 }
 

@@ -18,6 +18,10 @@ import (
 type Players interface {
 	NewPlayer(ctx context.Context) (token, playerID string, err error)
 	PlayerFor(ctx context.Context, token string) (string, error)
+	Username(ctx context.Context, player string) (string, error)
+	Claim(ctx context.Context, player, username, password string) error
+	Login(ctx context.Context, username, password string) (token, playerID, name string, err error)
+	Logout(ctx context.Context, token string) error
 }
 
 // Games is what the API needs from the games (a *games.Store).
@@ -28,6 +32,9 @@ type Games interface {
 	Answer(ctx context.Context, player, id string, a games.Answer) (games.AnswerResult, games.State, error)
 	GiveUp(ctx context.Context, player, id string) (games.State, error)
 	SilhouetteOf(ctx context.Context, player, id string, n int) (int, error)
+	Bests(ctx context.Context, player string) ([]games.Best, error)
+	Leaderboard(ctx context.Context, mode games.Mode, mask games.GenMask, limit int, player string) (games.Board, error)
+	Merge(ctx context.Context, from, to string) error
 }
 
 func gameRoutes(mux *http.ServeMux, c Config) {
@@ -44,24 +51,7 @@ func gameRoutes(mux *http.ServeMux, c Config) {
 	})
 
 	authed := func(pattern string, h func(w http.ResponseWriter, r *http.Request, player string)) {
-		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
-			token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if !ok || token == "" {
-				writeError(w, http.StatusUnauthorized, "send a token from POST /players as Authorization: Bearer <token>")
-				return
-			}
-			player, err := c.Players.PlayerFor(r.Context(), strings.TrimSpace(token))
-			if errors.Is(err, auth.ErrUnknownToken) {
-				writeError(w, http.StatusUnauthorized, "unknown token; get a new one from POST /players")
-				return
-			}
-			if err != nil {
-				serverError(w, r, err)
-				return
-			}
-			noStore(w)
-			h(w, r, player)
-		})
+		mux.HandleFunc(pattern, requirePlayer(c, h))
 	}
 
 	// POST /games {mode, gens} starts a game.
@@ -171,6 +161,50 @@ func gameRoutes(mux *http.ServeMux, c Config) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write(png)
 	})
+}
+
+// bearer returns the request's bearer token, if it has one.
+func bearer(r *http.Request) (string, bool) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token = strings.TrimSpace(token)
+	return token, ok && token != ""
+}
+
+// requirePlayer wraps h for requests that must come from a player: no token
+// or an unknown one is a 401. Responses are never cached.
+func requirePlayer(c Config, h func(w http.ResponseWriter, r *http.Request, player string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearer(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "send a token from POST /players as Authorization: Bearer <token>")
+			return
+		}
+		player, err := c.Players.PlayerFor(r.Context(), token)
+		if errors.Is(err, auth.ErrUnknownToken) {
+			writeError(w, http.StatusUnauthorized, "unknown token; get a new one from POST /players")
+			return
+		}
+		if err != nil {
+			serverError(w, r, err)
+			return
+		}
+		noStore(w)
+		h(w, r, player)
+	}
+}
+
+// optionalPlayer returns the player behind the request's token, or "" if it
+// has none or an unknown one.
+func optionalPlayer(c Config, r *http.Request) (string, error) {
+	token, ok := bearer(r)
+	if !ok {
+		return "", nil
+	}
+	player, err := c.Players.PlayerFor(r.Context(), token)
+	if errors.Is(err, auth.ErrUnknownToken) {
+		return "", nil
+	}
+	return player, err
 }
 
 // gameError answers a failed move.
