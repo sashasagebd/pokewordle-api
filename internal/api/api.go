@@ -85,7 +85,8 @@ func New(c Config) http.Handler {
 
 	gameRoutes(mux, c)
 	accountRoutes(mux, c)
-	return cors(c.AllowedOrigins, mux)
+	// CORS outside the limits, so a browser can read a 429 too.
+	return cors(c.AllowedOrigins, newLimits().middleware(mux))
 }
 
 // parseGens reads a comma-separated list of generation numbers (1 to 9).

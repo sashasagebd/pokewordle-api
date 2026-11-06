@@ -13,7 +13,7 @@ platform-managed Postgres, and is public through Cloudflare Tunnel.
 - [x] **Phase 1:** Pokémon data in Postgres, `GET /pokemon`, health check, deploy
 - [x] **Phase 2:** anonymous players, server-side games (the server holds the answer), Who's That silhouettes
 - [x] **Phase 3:** usernames (argon2id), best scores, leaderboards
-- [ ] **Phase 4:** rate limits for the whole API, cleanup of old games and players
+- [x] **Phase 4:** rate limits for the whole API, cleanup of idle games, stale guests and old logins
 
 ## API
 
@@ -91,8 +91,7 @@ Logging in with a guest's token merges the guest into the account: its games
 move over, each best score keeps whichever is better, and the guest is
 deleted. Passwords are hashed with argon2id (19 MiB, 2 passes, at most 2
 hashes at a time to stay inside the container's memory). The two password
-endpoints allow 10 tries a minute per IP (`CF-Connecting-IP`), and answer 429
-past that.
+endpoints allow 10 tries a minute (see [Rate limits](#rate-limits)).
 
 | Request | Answer |
 |---|---|
@@ -106,6 +105,36 @@ A best score is per mode and exact set of generations: the fewest guesses in
 a won Wordle, the longest streak otherwise. Streaks count as they grow, in the
 same transaction as the right answer, and a best only ever improves. Ties go
 to whoever got there first.
+
+### Rate limits
+
+Every route but `/healthz` is rate limited per client: its IPv4 address, or its
+IPv6 address's /64, from `CF-Connecting-IP`. Each is a token bucket, a rate
+with a burst on top:
+
+| Routes | Rate | Burst |
+|---|---|---|
+| `POST /players` | 30 an hour | 10 |
+| `POST /me/username`, `POST /sessions` | 10 a minute | 10 |
+| Other `POST`s and `DELETE`s (starting games, moves, logging out) | 2 a second | 20 |
+| `GET`s | 10 a second | 60 |
+
+Past it, the answer is a 429 with `Retry-After` (in seconds) and an `error`
+meant for the player. The buckets are in memory, so during a deploy each of
+the two running versions counts separately.
+
+### Cleanup
+
+Once an hour (starting 3 minutes after the app starts), the app tidies the
+database. An advisory lock makes sure only one running version does it at a
+time.
+
+- An active game with no move for 24 hours becomes `abandoned`. Best scores
+  were already recorded as it was played.
+- A guest created over 30 days ago with no session used in 30 days is
+  deleted, with its sessions, games and best scores. Their browser just gets
+  a new guest.
+- A session unused for a year is deleted. Its player logs in again.
 
 ## Pokémon data
 

@@ -5,26 +5,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/sashasagebd/pokewordle-api/internal/auth"
 	"github.com/sashasagebd/pokewordle-api/internal/games"
 )
 
-// Password endpoints allow this many attempts per client IP per minute.
-const passwordAttemptsPerMinute = 10
-
+// The password endpoints' rate limit is in ratelimit.go, with the others.
 func accountRoutes(mux *http.ServeMux, c Config) {
-	limiter := newRateLimiter(passwordAttemptsPerMinute, time.Minute)
-	limited := func(w http.ResponseWriter, r *http.Request) bool {
-		if limiter.allow(clientIP(r)) {
-			return true
-		}
-		w.Header().Set("Retry-After", "60")
-		writeError(w, http.StatusTooManyRequests, "Too many tries. Wait a minute and try again.")
-		return false
-	}
-
 	// GET /me: the player's username (null for a guest) and best scores.
 	mux.HandleFunc("GET /me", requirePlayer(c, func(w http.ResponseWriter, r *http.Request, player string) {
 		name, err := c.Players.Username(r.Context(), player)
@@ -47,9 +34,6 @@ func accountRoutes(mux *http.ServeMux, c Config) {
 	// POST /me/username {username, password}: a guest claims a name, keeping
 	// everything they've played.
 	mux.HandleFunc("POST /me/username", requirePlayer(c, func(w http.ResponseWriter, r *http.Request, player string) {
-		if !limited(w, r) {
-			return
-		}
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
@@ -78,9 +62,6 @@ func accountRoutes(mux *http.ServeMux, c Config) {
 	// account (and the guest is gone).
 	mux.HandleFunc("POST /sessions", func(w http.ResponseWriter, r *http.Request) {
 		noStore(w)
-		if !limited(w, r) {
-			return
-		}
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
