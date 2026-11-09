@@ -472,3 +472,195 @@ func TestASurvivalRaceInTheDatabase(t *testing.T) {
 		t.Errorf("second Pokémon: a's #%d, b's #%d", as[1], bs[1])
 	}
 }
+
+// --- Quick match --------------------------------------------------------------
+// Each test waits in its own set of generations: the database is shared, and
+// a waiter left from another test mustn't be matched.
+
+func (f *fixture) queue(player string, mode games.Mode, mask games.GenMask) string {
+	f.t.Helper()
+	code, err := f.store.Queue(f.ctx, player, mode, mask)
+	f.must(err)
+	return code
+}
+
+func TestQuickMatch(t *testing.T) {
+	f := setup(t)
+	gens := games.GenMask(0b1_0000_0011)
+	a, b := f.player(), f.player()
+
+	if code := f.queue(a, games.HigherLower, gens); code != "" {
+		t.Fatalf("matched alone, into %s", code)
+	}
+	if code := f.queue(a, games.HigherLower, gens); code != "" {
+		t.Fatal("matched with themselves on asking again")
+	}
+	code := f.queue(b, games.HigherLower, gens)
+	if code == "" {
+		t.Fatal("b wasn't matched with a, waiting")
+	}
+	// a hears about it on asking again.
+	if got := f.queue(a, games.HigherLower, gens); got != code {
+		t.Fatalf("a's next ask: %q, want %s", got, code)
+	}
+
+	id, err := f.store.IDOf(f.ctx, code)
+	f.must(err)
+	r, err := f.store.Get(f.ctx, id)
+	f.must(err)
+	if !r.Quick || r.Mode != games.HigherLower || r.Mask != gens || r.Host != a || len(r.Members) != 2 || r.Status != rooms.Lobby {
+		t.Fatalf("the room: %+v", r)
+	}
+
+	// It starts by itself once both are connected.
+	r, err = f.store.Connect(f.ctx, b, id)
+	f.must(err)
+	if r.Status != rooms.Lobby {
+		t.Fatal("started with only b connected")
+	}
+	r, err = f.store.Connect(f.ctx, a, id)
+	f.must(err)
+	if r.Status != rooms.Playing || r.Round == nil || r.Round.Mode != games.HigherLower || len(r.Round.Players) != 2 {
+		t.Fatalf("with both connected: %s, %+v", r.Status, r.Round)
+	}
+
+	// The match is used up: asking again is a new wait.
+	if got := f.queue(a, games.HigherLower, gens); got != "" {
+		t.Errorf("a asking again after the match: %q, want a new wait", got)
+	}
+	f.must(f.store.Unqueue(f.ctx, a))
+}
+
+func TestQuickMatchPairsLikeWithLike(t *testing.T) {
+	f := setup(t)
+	gens, other := games.GenMask(0b1_0000_0101), games.GenMask(0b1_0000_1001)
+	a, b, c, d := f.player(), f.player(), f.player(), f.player()
+	f.queue(a, games.HigherLower, gens)
+	if f.queue(b, games.WhosThat, gens) != "" {
+		t.Error("matched across modes")
+	}
+	if f.queue(c, games.HigherLower, other) != "" {
+		t.Error("matched across generations")
+	}
+	if f.queue(d, games.HigherLower, gens) == "" {
+		t.Error("d wasn't matched with a")
+	}
+	for _, p := range []string{b, c} {
+		f.must(f.store.Unqueue(f.ctx, p))
+	}
+}
+
+func TestQuickMatchSkipsTheGone(t *testing.T) {
+	f := setup(t)
+	gens := games.GenMask(0b1_0001_0001)
+	a, b := f.player(), f.player()
+	f.queue(a, games.Wordle, gens)
+	// a stopped asking: closed the tab.
+	_, err := f.pool.Exec(f.ctx, `UPDATE match_queue SET last_seen_at = last_seen_at - $2::float8 * interval '1 second'
+		WHERE player_id = $1::uuid`, a, (rooms.QueueTTL + time.Second).Seconds())
+	f.must(err)
+	if code := f.queue(b, games.Wordle, gens); code != "" {
+		t.Errorf("b was matched with a, gone, into %s", code)
+	}
+	// Cancelling works, and so does a's coming back.
+	f.must(f.store.Unqueue(f.ctx, b))
+	f.queue(a, games.Wordle, gens)
+	if f.queue(f.player(), games.Wordle, gens) == "" {
+		t.Error("a, back, wasn't matched")
+	}
+}
+
+func TestQuickMatchManyAtOnce(t *testing.T) {
+	f := setup(t)
+	gens := games.GenMask(0b1_0010_0001)
+	const n = 10
+	players := make([]string, n)
+	for i := range players {
+		players[i] = f.player()
+	}
+
+	// Everyone asks at once, and keeps asking until matched, as clients do.
+	codes := make([]string, n)
+	var wg sync.WaitGroup
+	for i, p := range players {
+		wg.Go(func() {
+			for range 100 {
+				code, err := f.store.Queue(f.ctx, p, games.WhosThat, gens)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if code != "" {
+					codes[i] = code
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+	wg.Wait()
+
+	// Five rooms of two: nobody left out, nobody in two.
+	rooms := map[string]int{}
+	for i, code := range codes {
+		if code == "" {
+			t.Fatalf("player %d was never matched", i)
+		}
+		rooms[code]++
+	}
+	if len(rooms) != n/2 {
+		t.Errorf("%d rooms for %d players, want %d", len(rooms), n, n/2)
+	}
+	for code, count := range rooms {
+		id, err := f.store.IDOf(f.ctx, code)
+		f.must(err)
+		r, err := f.store.Get(f.ctx, id)
+		f.must(err)
+		if count != 2 || len(r.Members) != 2 {
+			t.Errorf("room %s: told to %d players, has %d members", code, count, len(r.Members))
+		}
+	}
+}
+
+func TestQuickMatchNobodyIsMatchedTwice(t *testing.T) {
+	f := setup(t)
+	gens := games.GenMask(0b1_0100_0001)
+	modes := []games.Mode{games.HigherLower, games.WhosThat}
+	const n = 8
+	players := make([]string, n)
+	for i := range players {
+		players[i] = f.player()
+	}
+
+	// Everyone asks at once, switching mode on every ask: matches are made
+	// by one player's ask while another's, in the other mode, is under way.
+	var wg sync.WaitGroup
+	for i, p := range players {
+		wg.Go(func() {
+			for try := range 200 {
+				code, err := f.store.Queue(f.ctx, p, modes[(i+try)%2], gens)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if code != "" {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			t.Errorf("player %d was never matched", i)
+		})
+	}
+	wg.Wait()
+
+	// What counts is the rooms: each player in exactly one.
+	for i, p := range players {
+		var in int
+		f.must(f.pool.QueryRow(f.ctx, `
+			SELECT count(*) FROM room_members m JOIN rooms r ON r.id = m.room_id
+			WHERE m.player_id = $1::uuid AND r.quick`, p).Scan(&in))
+		if in != 1 {
+			t.Errorf("player %d is in %d quick rooms, want 1", i, in)
+		}
+	}
+}

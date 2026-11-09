@@ -18,6 +18,8 @@ type Rooms interface {
 	Join(ctx context.Context, player, id string) (*rooms.Room, error)
 	Ticket(ctx context.Context, player, code string) (ticket, roomID string, err error)
 	Redeem(ctx context.Context, ticket string) (player, roomID string, err error)
+	Queue(ctx context.Context, player string, mode games.Mode, mask games.GenMask) (code string, err error)
+	Unqueue(ctx context.Context, player string) error
 }
 
 // Sockets runs a room's sockets (a *live.Hub).
@@ -77,6 +79,49 @@ func roomRoutes(mux *http.ServeMux, c Config) {
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]string{"ticket": ticket})
+	})
+
+	// POST /queue {mode, gens}: quick match. Waits for an opponent, or keeps
+	// waiting: ask again every couple of seconds (one who stops counts as
+	// gone). {"status": "waiting"}, or {"status": "matched", "code"} once
+	// there's a room, which starts by itself once both are connected.
+	authed("POST /queue", func(w http.ResponseWriter, r *http.Request, player string) {
+		var body struct {
+			Mode string `json:"mode"`
+			Gens []int  `json:"gens"`
+		}
+		if !readJSON(w, r, &body) {
+			return
+		}
+		mode, err := games.ParseMode(body.Mode)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		mask, err := games.MaskOf(body.Gens)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		code, err := c.Rooms.Queue(r.Context(), player, mode, mask)
+		if err != nil {
+			serverError(w, r, err)
+			return
+		}
+		if code == "" {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "waiting"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "matched", "code": code})
+	})
+
+	// DELETE /queue stops waiting (204).
+	authed("DELETE /queue", func(w http.ResponseWriter, r *http.Request, player string) {
+		if err := c.Rooms.Unqueue(r.Context(), player); err != nil {
+			serverError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	// GET /ws?ticket= opens a room's socket.

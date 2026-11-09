@@ -18,7 +18,8 @@ Code paths are in this repo; phase 4 is in the frontend,
 - [x] **5. Every mode:** Higher or Lower and Who's That in rooms too, as survival races over the same Pokémon ([below](#every-mode))
 - [ ] **6. Resilience:** a deploy, the database dropping `LISTEN`, deadlines with nobody connected and tabs on two instances, each staged in CI ([Testing](#testing)); `cmd/versuscheck` through a real deploy still to run
 - [ ] **7. Load and observability:** `cmd/versusload` (bots in many rooms, reply and broadcast latency), room and round logs, a `hub stats` log line with fanout times; the README's numbers still to measure
-- [ ] **Later:** a quick-match queue (it just pairs two players into a room), ping-compensated times, ratings
+- [x] **8. Quick match:** a queue per mode and set of generations, pairing the longest-waiting into a room that starts by itself ([below](#quick-match))
+- [ ] **Later:** ping-compensated times, ratings
 
 Phases 1 to 4 make it playable, 5 makes it every game, and 6 and 7 make it
 solid.
@@ -104,6 +105,32 @@ That are streak games, so in a room they're a **survival race**:
 - **Tests:** rules for survival races (ties on time, the last one standing
   ahead or behind, the time limit), the seeded sequence being the same for
   every player whatever their pace, and a two-instance socket test per mode.
+
+## Quick match
+
+On `/versus`, a player picks a mode and finds a match: they're paired with
+whoever has waited longest for the same mode and generations (the home
+page's). The two get a room of their own, hosted by the one who waited,
+which starts its first round by itself once both are connected: queuing is
+being ready. After that it's an ordinary room, rematches and all.
+
+- **Waiting is asking again**, `POST /queue` every 2 seconds, answered
+  `waiting` or `matched` with the room's code. One not heard from for 10
+  seconds has gone (closed the tab) and isn't matched with. No socket until
+  there's a room.
+- **Each ask tries to match**, so two asking at once can't both end up
+  waiting for each other: matching in one mode and set of generations is
+  one ask at a time, on every instance (a transaction-scoped advisory lock).
+- **Nobody is matched twice:** everything about one player's wait happens
+  one thing at a time (their `players` row, locked `FOR NO KEY UPDATE`), and
+  a partner is locked, then checked to be still waiting, before they're
+  taken. The other's next ask picks up the code (`match_found`).
+- [0007_quick_match.sql](internal/db/migrations/0007_quick_match.sql):
+  `match_queue`, `match_found` and `rooms.quick`. Cleanup forgets waits and
+  matches left for a minute.
+- **Tests:** a pairing and its room starting by itself; only like with like;
+  the gone skipped; ten players asking at once making five rooms of two; and
+  eight switching modes on every ask, each ending up in exactly one room.
 
 ## Architecture
 
@@ -199,6 +226,8 @@ player's race: their game, guesses, when they solved it or forfeited) and
 | `POST /rooms` `{gens}` | Makes a room with you as host: `{code}` (201). |
 | `POST /rooms/{code}/join` | Joins (again, harmlessly, if you're in): `{code}`. 404 for an unknown or closed room, 409 if it's full. |
 | `POST /rooms/{code}/ticket` | `{ticket}` (201) for the socket, good for 30 seconds, once. 403 if you're not in the room. |
+| `POST /queue` `{mode, gens}` | Quick match: `{"status": "waiting"}` or `{"status": "matched", "code"}`. Ask again every couple of seconds to keep waiting. |
+| `DELETE /queue` | Stops waiting (204). |
 | `GET /ws?ticket=` | The socket. 401 for a bad ticket, 403 from an origin not in `ALLOWED_ORIGINS` (no `Origin`, not a browser, is fine). |
 
 Joining and making rooms share the 2-a-second `POST` bucket, which makes

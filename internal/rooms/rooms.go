@@ -103,6 +103,10 @@ type Room struct {
 	// Seq counts the room's saved changes. The store bumps it; the rules
 	// don't use it. A client that has seen the latest seq is up to date.
 	Seq int
+	// Quick marks a quick-match room: its players queued for it, which is
+	// being ready, so its first round starts by itself once they're all
+	// connected (StartQuick). After that it's like any room.
+	Quick bool
 }
 
 // A Member is a player in a room.
@@ -400,6 +404,33 @@ func (r *Room) Start(player string, answerID int, now time.Time) error {
 	r.Round, r.Status = rd, Playing
 	r.changed(now)
 	return nil
+}
+
+// QuickReady reports whether a quick-match room should start its first round
+// now: it hasn't had one, and everyone in it (two at least) is connected.
+func (r *Room) QuickReady() bool {
+	if !r.Quick || r.Status != Lobby || r.Round != nil || len(r.Members) < MinPlayers {
+		return false
+	}
+	for i := range r.Members {
+		if !r.Members[i].connected() {
+			return false
+		}
+	}
+	return true
+}
+
+// StartQuick starts a quick-match room's first round, as its host would,
+// with everyone counted ready (they queued for it). See Start for answerID.
+func (r *Room) StartQuick(answerID int, now time.Time) error {
+	r.Advance(now)
+	if !r.QuickReady() {
+		return ErrNotReady
+	}
+	for i := range r.Members {
+		r.Members[i].Ready = true
+	}
+	return r.Start(r.Host, answerID, now)
 }
 
 // Guess records that player made a guess in a Wordle round, which solved it
