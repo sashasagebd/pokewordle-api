@@ -1,0 +1,218 @@
+# Versus: real-time multiplayer rooms
+
+The plan for Phase 5: friends race each other at the same Wordle in a room
+they join with a code, see each other's progress live, and the server decides
+who won. It builds on what's already here: Wordle games run server-side by
+`games.Engine`, kept in Postgres, each move a transaction with the game's row
+locked, retries made harmless by the round number `n`.
+
+Code paths are in this repo; phase 4 is in the frontend,
+[pokewordle](https://github.com/sashasagebd/pokewordle).
+
+## Status
+
+- [x] **1. Rules:** `internal/rooms`, the pure rules of a room (no database, no clock), with tests
+- [ ] **2. Store:** migration, `rooms.Store`, socket tickets, solo games ignoring room games
+- [ ] **3. Sockets:** `/ws`, a hub per instance, `LISTEN`/`NOTIFY` between instances
+- [ ] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch
+- [ ] **5. Resilience:** resume with a snapshot, grace and forfeit, closing sockets on shutdown, room expiry
+- [ ] **6. Load and observability:** a bot load generator, per-room logs, latency numbers in the README
+- [ ] **Later:** a quick-match queue (it just pairs two players into a room), ping-compensated times, ratings
+
+Phases 1 to 4 make it playable; 5 and 6 make it solid.
+
+## How it plays
+
+1. A player creates a room, picks the generations, and gets a code like
+   `K7QX2M` and a link, `/versus/K7QX2M`. Codes are 6 characters from an
+   alphabet without look-alikes (no 0/O, 1/I/L): 31⁶, about 900 million.
+2. Friends join with the code, up to 4 in a room. The lobby shows who's in,
+   who's ready, and the host's settings. Changing the settings unreadies
+   everyone, so nobody starts a round they didn't agree to.
+3. Once everyone else is ready, the host starts the round: a 3 second
+   countdown on the server's clock, then everyone gets the same answer.
+4. The first to solve it wins. Everyone else is ranked by when they solved it
+   (then by guesses), then those who didn't, then those who forfeited.
+   - A round lasts at most 5 minutes, and at most 1 more minute after the
+     first solve, so the winner isn't kept waiting.
+   - It ends as soon as at most one player is still playing: their place
+     can't change any more. With two players, the first solve ends it.
+   - If everyone else forfeited, the last one standing wins. Nobody solving
+     it is a draw.
+5. While playing you see each opponent's guess count and result tiles
+   (height, weight, type), never which Pokémon they guessed: that would give
+   their deductions away. Everyone's guesses are shown once the round ends.
+6. After a round the room is back in its lobby: **rematch** is just starting
+   again. Someone who joins during a round waits in the room and plays the
+   next one.
+
+Room games don't count toward solo best scores or leaderboards.
+
+## Architecture
+
+**Rules are pure.** `internal/rooms` holds a room's state and every change
+to it, each taking the time it happens at. No timers inside: `Advance(now)`
+applies whatever deadlines have passed (the round's end, a disconnected
+player's grace running out, an idle room closing) and every change calls it
+first, so the state is right however late a timer fires. `Deadline()` says
+when the next one is due, for the hub's timer.
+
+**Each player's race is an ordinary Wordle game.** Starting a round makes
+one `games` row per player with the shared answer, so guesses go through
+the existing `Engine.Guess` and `Store.move`. In the same transaction the
+store tells the room (`Room.Guess`); if the room says no (the round is over),
+the whole move rolls back.
+
+**Postgres is the source of truth; memory only holds sockets.** A deploy
+runs the new version next to the old one against the same database, and
+then stops the old one, so two players in one room can be on different
+instances, and every deploy disconnects everyone. So:
+
+- Each instance has a hub: room ID → its own sockets there.
+- A change commits, then `NOTIFY room_events, '<roomId>:<seq>'`.
+- Each instance keeps one dedicated connection `LISTEN`ing, and on a notify
+  reloads the room and pushes to its local sockets.
+- On shutdown, sockets are closed with code 1012 (service restart):
+  `srv.Shutdown` doesn't close hijacked connections by itself. Clients
+  reconnect straight away, to whichever version is live.
+
+**The clock is the database's.** Times come from `now()`, never an
+instance's clock. Ending a round is idempotent
+(`UPDATE … WHERE … AND finished_at IS NULL`), so whichever instance gets
+there first does it. Each instance with sockets in a room sets a timer for
+its `Deadline()`, and a once-a-second sweeper covers rooms nobody is
+connected to.
+
+**Sockets** use `github.com/coder/websocket`.
+
+- Auth: browsers can't send `Authorization` on a WebSocket, and a token in
+  the URL would end up in logs. So `POST /rooms/{code}/ticket` (bearer auth
+  as usual) returns a single-use ticket good for 30 seconds, and the socket
+  is `GET /ws?ticket=…`.
+- CORS doesn't cover WebSockets, so `Origin` is checked against
+  `ALLOWED_ORIGINS` by hand.
+- The server's `WriteTimeout` would kill a socket after 30 seconds:
+  clear it per connection with `http.ResponseController`. The middleware
+  mustn't hide `http.Hijacker`.
+- Pings every 25 seconds: Cloudflare Tunnel drops idle connections at
+  about 100.
+- Several tabs can share a player: the hub counts a player's sockets and
+  only tells the room they disconnected when the last one closes.
+
+**Disconnects.** A member counts as disconnected from when their socket
+closes (or from joining, until it opens). Disconnecting unreadies them.
+After 30 seconds of grace they forfeit any round they're playing, and are
+removed from the lobby. Reconnecting in time changes nothing; their clock
+kept running.
+
+**Fairness.** For now, a synced countdown: the server sends
+`{startsAt, serverNow}`, so each client knows its clock offset and starts
+on the same moment. Times are credited when the server receives the guess.
+Ping-compensated credit (receive time minus half the measured round trip,
+capped at 150 ms so faking lag doesn't pay) can come later.
+
+## Schema (`0005_rooms.sql`, additions only)
+
+```sql
+CREATE TABLE rooms (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  code text NOT NULL UNIQUE,
+  host_id uuid REFERENCES players ON DELETE SET NULL,
+  gen_mask smallint NOT NULL CHECK (gen_mask BETWEEN 1 AND 511),
+  status text NOT NULL CHECK (status IN ('lobby', 'playing', 'closed')),
+  seq integer NOT NULL DEFAULT 0,  -- bumped on every change, for resume
+  last_activity_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now());
+
+CREATE TABLE room_members (
+  room_id uuid REFERENCES rooms ON DELETE CASCADE,
+  player_id uuid REFERENCES players ON DELETE CASCADE,
+  name text NOT NULL,  -- the username, or "Guest 1234"
+  ready boolean NOT NULL DEFAULT false,
+  joined_at timestamptz NOT NULL DEFAULT now(),
+  disconnected_at timestamptz DEFAULT now(),
+  PRIMARY KEY (room_id, player_id));
+
+CREATE TABLE room_rounds (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  room_id uuid NOT NULL REFERENCES rooms ON DELETE CASCADE,
+  n integer NOT NULL,
+  answer_id integer NOT NULL REFERENCES pokemon,
+  starts_at timestamptz NOT NULL, ends_at timestamptz NOT NULL,
+  finished_at timestamptz,
+  UNIQUE (room_id, n));
+
+CREATE TABLE room_round_players (
+  round_id uuid REFERENCES room_rounds ON DELETE CASCADE,
+  player_id uuid REFERENCES players ON DELETE CASCADE,
+  game_id uuid NOT NULL REFERENCES games ON DELETE CASCADE,
+  guesses integer NOT NULL DEFAULT 0,
+  solved_at timestamptz, forfeited_at timestamptz,
+  PRIMARY KEY (round_id, player_id));
+
+CREATE TABLE ws_tickets (
+  hash bytea PRIMARY KEY CHECK (length(hash) = 32),
+  player_id uuid NOT NULL REFERENCES players ON DELETE CASCADE,
+  room_id uuid NOT NULL REFERENCES rooms ON DELETE CASCADE,
+  expires_at timestamptz NOT NULL);
+
+ALTER TABLE games ADD COLUMN room_round_id uuid REFERENCES room_rounds ON DELETE SET NULL;
+```
+
+- `Store.Start`'s "abandon your other active Wordle game" must skip room
+  games (`AND room_round_id IS NULL`), and `improvesBest` must skip them
+  too. During a deploy the old version doesn't know the column, so starting
+  a solo Wordle there would abandon a room game in progress. Short-lived
+  and harmless enough, but worth knowing.
+- Cleanup: rooms idle for 30 minutes close (the rules decide; the sweeper
+  applies it), closed rooms are deleted after a day, expired tickets
+  hourly.
+
+## API
+
+| Request | What |
+|---|---|
+| `POST /rooms` `{gens}` | Makes a room with you as host: `{code}` (201). |
+| `POST /rooms/{code}/join` | Joins (again, harmlessly, if you're in). 404 for an unknown or closed room, 409 if it's full. |
+| `POST /rooms/{code}/ticket` | `{ticket}` for the socket. |
+| `GET /ws?ticket=` | The socket. |
+
+Joining and making rooms share the 2-a-second `POST` bucket, which makes
+guessing codes hopeless.
+
+Messages are JSON. Every one from the server carries the room's `seq`.
+
+| Client → server | |
+|---|---|
+| `resume {code, lastSeq}` | First message; answered with a `snapshot` |
+| `ready {ready}` | Lobby |
+| `settings {gens}` | Host, lobby |
+| `start` | Host, everyone else ready |
+| `guess {n, name}` | `n` as in solo Wordle, so a resend is harmless |
+| `forfeit`, `leave` | |
+
+| Server → client | |
+|---|---|
+| `snapshot` | The whole room as you may see it, `serverNow` included |
+| `lobby {members, host, gens}` | |
+| `countdown {startsAt, endsAt, serverNow}` | A round is starting |
+| `guessResult {n, comparison}` | To the guesser only |
+| `progress {playerId, tiles}` | Someone's guess, without the Pokémon |
+| `presence {playerId, connected, graceEndsAt}` | |
+| `finished {ranking, winner, answer, guesses}` | |
+| `error {msg}` | A move that couldn't be played, for the player |
+
+At most 5 messages a second per socket, on top of the HTTP limits.
+
+## Testing
+
+- **Rules:** table tests with a fake clock: races, ties, the finish
+  window, timeouts, forfeits, grace, host handover, rematches, expiry.
+- **Store:** against Postgres, as CI already does.
+- **Sockets:** `httptest` with real `coder/websocket` clients playing whole
+  rounds, **with the clients split across two API instances** on one
+  database, so `LISTEN`/`NOTIFY` is what carries the game.
+- **Resilience:** stop an instance mid-round; its clients reconnect to the
+  other and the round finishes right. Then for real, during a deploy.
+- **Load:** `cmd/bots` plays many rooms at once against a deployed API and
+  reports guess-to-broadcast latency (p50, p99), for a table in the README.
