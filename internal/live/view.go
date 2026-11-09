@@ -32,6 +32,7 @@ func PublicID(roomID, player string) string {
 type View struct {
 	Code    string       `json:"code"`
 	Status  rooms.Status `json:"status"`
+	Mode    games.Mode   `json:"mode"` // the next round's
 	Gens    []int        `json:"gens"`
 	You     string       `json:"you"`  // your public ID
 	Host    string       `json:"host"` // the host's
@@ -55,14 +56,17 @@ type MemberView struct {
 // far its own clock is off from the serverNow sent with each view.
 type RoundView struct {
 	N          int        `json:"n"`
+	Mode       games.Mode `json:"mode"`
 	StartsAt   time.Time  `json:"startsAt"` // the end of the countdown
 	EndsAt     time.Time  `json:"endsAt"`   // the latest it ends
 	FinishedAt *time.Time `json:"finishedAt,omitempty"`
 	// Players are in their places (standings so far, while it's on).
 	Players []PlayerView `json:"players"`
 	// Winner is the winner's public ID once it's over: absent for a draw.
-	Winner string           `json:"winner,omitempty"`
-	Answer *pokedex.Pokemon `json:"answer,omitempty"` // once it's over
+	Winner string `json:"winner,omitempty"`
+	// Answer is Wordle's, once it's over. (In a survival race, each player's
+	// run ends on its own Pokémon: PlayerView.EndedOn.)
+	Answer *pokedex.Pokemon `json:"answer,omitempty"`
 	// Game is your own race, as a solo Wordle shows it, if you're in the
 	// round: everything you've guessed, and the answer once it's over.
 	Game *games.State `json:"game,omitempty"`
@@ -74,15 +78,22 @@ type PlayerView struct {
 	Name    string        `json:"name"`
 	Rank    int           `json:"rank"`
 	Outcome rooms.Outcome `json:"outcome"`
-	Racing  bool          `json:"racing"` // still playing it
-	Guesses int           `json:"guesses"`
-	TimeMs  int64         `json:"timeMs,omitempty"` // how long they took to solve it
-	// Tiles are their guesses' results without the Pokémon guessed: while
-	// the round is on, which ones they tried would give their deductions
-	// away.
+	Racing  bool          `json:"racing"`  // still playing it
+	Guesses int           `json:"guesses"` // Wordle
+	Score   int           `json:"score"`   // streak modes: their streak
+	// TimeMs is how long they took to solve it (Wordle) or reach their
+	// streak (the others).
+	TimeMs int64 `json:"timeMs,omitempty"`
+	// Tiles (Wordle) are their guesses' results without the Pokémon guessed:
+	// while the round is on, which ones they tried would give their
+	// deductions away. In the streak modes there's nothing like them to
+	// show: in Who's That, someone's right answer is the answer.
 	Tiles []Tile `json:"tiles"`
-	// Comparisons are their guesses in full, once the round is over.
+	// Comparisons are their Wordle guesses in full, once the round is over.
 	Comparisons []games.Comparison `json:"comparisons,omitempty"`
+	// EndedOn is the Pokémon a streak run ended on (missed, or being
+	// answered when it ended), once the round is over.
+	EndedOn *pokedex.Pokemon `json:"endedOn,omitempty"`
 }
 
 // A Tile is a guess's result, as a Wordle row shows it, without the guess.
@@ -97,7 +108,7 @@ type Tile struct {
 // by player ID (one missing just shows no guesses).
 func ViewFor(r *rooms.Room, states map[string]games.State, player string) View {
 	v := View{
-		Code: r.Code, Status: r.Status, Gens: r.Mask.Gens(),
+		Code: r.Code, Status: r.Status, Mode: r.Mode, Gens: r.Mask.Gens(),
 		You: PublicID(r.ID, player), Members: []MemberView{},
 	}
 	if r.Host != "" {
@@ -120,7 +131,8 @@ func ViewFor(r *rooms.Room, states map[string]games.State, player string) View {
 func roundView(r *rooms.Room, states map[string]games.State, player string) *RoundView {
 	rd := r.Round
 	over := !rd.FinishedAt.IsZero()
-	rv := &RoundView{N: rd.N, StartsAt: rd.StartsAt, EndsAt: rd.EndsAt, Players: []PlayerView{}}
+	wordle := rd.Mode == games.Wordle
+	rv := &RoundView{N: rd.N, Mode: rd.Mode, StartsAt: rd.StartsAt, EndsAt: rd.EndsAt, Players: []PlayerView{}}
 	if over {
 		rv.FinishedAt = &rd.FinishedAt
 		if w := rd.Winner(); w != "" {
@@ -136,18 +148,21 @@ func roundView(r *rooms.Room, states map[string]games.State, player string) *Rou
 		st := states[place.PlayerID]
 		pv := PlayerView{
 			ID: PublicID(r.ID, place.PlayerID), Name: names[place.PlayerID],
-			Rank: place.Rank, Outcome: place.Outcome, Guesses: place.Guesses,
-			Racing: !over && place.Outcome == rooms.Unsolved,
+			Rank: place.Rank, Outcome: place.Outcome, Guesses: place.Guesses, Score: place.Score,
+			Racing: !over && (place.Outcome == rooms.Unsolved || place.Outcome == rooms.Standing),
 			TimeMs: place.Time.Milliseconds(), Tiles: []Tile{},
 		}
 		for _, c := range st.Guesses {
 			pv.Tiles = append(pv.Tiles, Tile{c.Height, c.Weight, c.Type, c.Correct})
 		}
-		if over {
+		switch {
+		case over && wordle:
 			pv.Comparisons = st.Guesses
-		}
-		if st.Answer != nil && over {
-			rv.Answer = st.Answer
+			if st.Answer != nil {
+				rv.Answer = st.Answer
+			}
+		case over:
+			pv.EndedOn = st.Answer
 		}
 		rv.Players = append(rv.Players, pv)
 	}

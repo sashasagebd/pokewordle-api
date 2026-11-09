@@ -368,3 +368,75 @@ func TestSocketsCheckOriginAndTickets(t *testing.T) {
 	a.post(t, "/rooms/"+made.Code+"/ticket", a.newPlayer(t), nil, http.StatusForbidden, nil)
 	a.post(t, "/rooms/ZZZZZZ/join", token, nil, http.StatusNotFound, nil)
 }
+
+// pairOf returns Higher or Lower round n of room code's latest round (the
+// same for every player): the Pokémon shown and the one whose value is
+// hidden, as only a test may see them.
+func (in *instance) pairOf(t *testing.T, code string, n int) (shown, hidden pokedex.Pokemon) {
+	t.Helper()
+	var other, answer int
+	if err := in.pool.QueryRow(context.Background(), `
+		SELECT gr.other_id, gr.answer_id FROM game_rounds gr
+		JOIN room_round_players p ON p.game_id = gr.game_id
+		JOIN room_rounds rd ON rd.id = p.round_id
+		JOIN rooms r ON r.id = rd.room_id
+		WHERE r.code = $1 AND gr.n = $2 ORDER BY rd.n DESC LIMIT 1`, code, n).Scan(&other, &answer); err != nil {
+		t.Fatal(err)
+	}
+	return in.dex.Get(other), in.dex.Get(answer)
+}
+
+func TestAHigherOrLowerRaceAcrossTwoInstances(t *testing.T) {
+	a, b := start(t), start(t)
+	code, alice, bob, aliceID, bobID := room(t, a, b)
+
+	alice.send(map[string]any{"type": "settings", "mode": "higher_lower", "gens": []int{1}})
+	bob.awaitRoom("the mode change", func(v live.View) bool { return v.Mode == "higher_lower" })
+	bob.send(map[string]any{"type": "ready", "ready": true})
+	alice.awaitRoom("bob ready", func(v live.View) bool { return member(v, bobID).Ready })
+	alice.send(map[string]any{"type": "start"})
+	for _, c := range []*client{alice, bob} {
+		v := c.awaitRoom("the round", func(v live.View) bool { return v.Status == rooms.Playing })
+		if v.Round.Mode != "higher_lower" || v.Round.Game == nil || v.Round.Game.Round == nil || v.Round.Game.Round.Current == nil {
+			t.Fatalf("round started: %+v", v.Round)
+		}
+	}
+	a.skipCountdown(t, code)
+
+	// A stat the two differ on: a tie would count either answer as right.
+	shown, hidden := a.pairOf(t, code, 1)
+	stat, s, h := "height", shown.Height, hidden.Height
+	if s == h {
+		stat, s, h = "weight", shown.Weight, hidden.Weight
+	}
+	if s == h {
+		t.Skip("the first pair ties on both stats")
+	}
+	right, wrong := "higher", "lower"
+	if h < s {
+		right, wrong = wrong, right
+	}
+
+	alice.send(map[string]any{"type": "answer", "n": 1, "dir": right, "stat": stat})
+	var got struct {
+		Type    string `json:"type"`
+		Correct bool   `json:"correct"`
+	}
+	m := alice.await("alice's result", func(m msg) bool { return m.Type == "answer" })
+	if err := json.Unmarshal([]byte(m.raw), &got); err != nil || !got.Correct {
+		t.Fatalf("alice's right answer: %s", m.raw)
+	}
+	bob.awaitRoom("alice's streak", func(v live.View) bool { return player(v, aliceID).Score == 1 })
+
+	// Bob misses the same pair: alice is ahead and alone, so she's won.
+	bob.send(map[string]any{"type": "answer", "n": 1, "dir": wrong, "stat": stat})
+	for _, c := range []*client{alice, bob} {
+		v := c.awaitRoom("the result", func(v live.View) bool { return v.Round != nil && v.Round.FinishedAt != nil })
+		if v.Round.Winner != aliceID {
+			t.Errorf("winner %q, want alice", v.Round.Winner)
+		}
+		if p := player(v, bobID); p.Outcome != rooms.Out || p.EndedOn == nil || p.EndedOn.ID != hidden.ID {
+			t.Errorf("bob in the results: %+v", p)
+		}
+	}
+}

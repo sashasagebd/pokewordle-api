@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sashasagebd/pokewordle-api/internal/auth"
@@ -391,5 +392,83 @@ func TestADeletedHostIsHandedOn(t *testing.T) {
 	f.must(err)
 	if got.Host != ps[1] || len(got.Members) != 1 {
 		t.Errorf("host %q with %d members, want %s alone", got.Host, len(got.Members), ps[1])
+	}
+}
+
+// roundsOf returns the Pokémon in each round of a game so far (answer IDs,
+// in order), as only a test may see them.
+func (f *fixture) roundsOf(gameID string) []int {
+	f.t.Helper()
+	rows, err := f.pool.Query(f.ctx, `SELECT answer_id FROM game_rounds WHERE game_id = $1::uuid ORDER BY n`, gameID)
+	f.must(err)
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	f.must(err)
+	return ids
+}
+
+func TestASurvivalRaceInTheDatabase(t *testing.T) {
+	f := setup(t)
+	r, ps := f.lobby(1)
+	a, b := ps[0], ps[1]
+	r, err := f.store.SetSettings(f.ctx, a, r.ID, games.WhosThat, games.AllGens)
+	f.must(err)
+	_, err = f.store.SetReady(f.ctx, b, r.ID, true)
+	f.must(err)
+	r, err = f.store.Start(f.ctx, a, r.ID)
+	f.must(err)
+	if r.Round.Mode != games.WhosThat || r.Round.Seed == 0 {
+		t.Fatalf("round: %+v", r.Round)
+	}
+	f.fastForward(r.ID, rooms.Countdown)
+	aGame, bGame := r.Round.Players[0].GameID, r.Round.Players[1].GameID
+
+	// Wordle's move doesn't work here.
+	_, _, err = f.store.Guess(f.ctx, a, r.ID, 1, "pikachu")
+	wantErr(t, err, rooms.ErrWrongMove)
+
+	// a gets two right; then b meets the same first Pokémon, and misses.
+	for n := 1; n <= 2; n++ {
+		name := f.dex.Get(f.roundsOf(aGame)[n-1]).Name
+		res, _, err := f.store.Answer(f.ctx, a, r.ID, games.Answer{N: n, Name: name})
+		f.must(err)
+		if !res.Correct || res.Game.Score != n {
+			t.Fatalf("a's answer %d: %+v", n, res)
+		}
+	}
+	// A resend is refused, not counted.
+	_, _, err = f.store.Answer(f.ctx, a, r.ID, games.Answer{N: 2, Name: "pikachu"})
+	wantErr(t, err, games.ErrWrongRound)
+
+	if first, theirs := f.roundsOf(aGame)[0], f.roundsOf(bGame)[0]; first != theirs {
+		t.Fatalf("a's first Pokémon is #%d, b's #%d", first, theirs)
+	}
+	wrong := "bulbasaur"
+	if f.dex.Get(f.roundsOf(bGame)[0]).Name == wrong {
+		wrong = "ivysaur"
+	}
+	res, r, err := f.store.Answer(f.ctx, b, r.ID, games.Answer{N: 1, Name: wrong})
+	f.must(err)
+	if res.Correct || res.Game.Status != games.Lost {
+		t.Fatalf("b's miss: %+v", res)
+	}
+
+	// a is ahead and the only one going: they've won.
+	if r.Status != rooms.Lobby || r.Round.Winner() != a {
+		t.Fatalf("after b's miss: %s, winner %q", r.Status, r.Round.Winner())
+	}
+	if s := f.gameStatus(a, aGame); s != games.Lost {
+		t.Errorf("a's game is %s once the round ended, want lost (over, showing its Pokémon)", s)
+	}
+	got, err := f.store.Get(f.ctx, r.ID)
+	f.must(err)
+	if got.Mode != games.WhosThat || got.Round.Mode != games.WhosThat || got.Round.Players[0].Score != 2 ||
+		got.Round.Players[1].OutAt.IsZero() || got.Round.Seed != r.Round.Seed {
+		t.Errorf("read back: %+v, round %+v", got, got.Round)
+	}
+
+	// The same Pokémon in a's later rounds, whoever plays them: b's second
+	// round (made in advance) matches a's.
+	if as, bs := f.roundsOf(aGame), f.roundsOf(bGame); as[1] != bs[1] {
+		t.Errorf("second Pokémon: a's #%d, b's #%d", as[1], bs[1])
 	}
 }

@@ -441,3 +441,148 @@ func TestRankingWhilePlaying(t *testing.T) {
 		t.Errorf("winner %q while the round is on", w)
 	}
 }
+
+// --- Survival races (the streak modes) ---------------------------------------
+
+// startedIn is started, in mode.
+func startedIn(t *testing.T, mode games.Mode, others ...string) *Room {
+	t.Helper()
+	r := lobby(t, others...)
+	must(t, r.SetSettings("a", mode, games.AllGens, t0))
+	for _, p := range others {
+		must(t, r.SetReady(p, true, t0)) // the change unreadied them
+	}
+	must(t, r.Start("a", answer, t0))
+	return r
+}
+
+// run has player answer right times, a second apart, the last at when, then
+// (if out) wrong a second later.
+func run(t *testing.T, r *Room, player string, right int, out bool, when time.Time) {
+	t.Helper()
+	for i := range right {
+		must(t, r.Answer(player, true, when.Add(-time.Duration(right-1-i)*time.Second)))
+	}
+	if out {
+		must(t, r.Answer(player, false, when.Add(time.Second)))
+	}
+}
+
+func wantScores(t *testing.T, rd *Round, want map[string]int) {
+	t.Helper()
+	for _, p := range rd.Ranking() {
+		if p.Score != want[p.PlayerID] {
+			t.Errorf("%s's streak = %d, want %d", p.PlayerID, p.Score, want[p.PlayerID])
+		}
+	}
+}
+
+func TestSurvivalTheLongestStreakWins(t *testing.T) {
+	r := startedIn(t, games.HigherLower, "b", "c")
+	if r.Round.Mode != games.HigherLower {
+		t.Fatalf("round mode %s", r.Round.Mode)
+	}
+	run(t, r, "a", 3, true, play(time.Minute))
+	run(t, r, "b", 5, true, play(90*time.Second))
+	// c is the only one left, but behind b: they play on.
+	run(t, r, "c", 5, false, play(2*time.Minute))
+	if r.Status != Playing {
+		t.Fatal("ended with c still able to catch up")
+	}
+	// Level with b isn't ahead; one more is.
+	must(t, r.Answer("c", true, play(2*time.Minute+time.Second)))
+	wantFinished(t, r, play(2*time.Minute+time.Second), "c")
+	wantRanking(t, r.Round, place{"c", 1, Standing}, place{"b", 2, Out}, place{"a", 3, Out})
+	wantScores(t, r.Round, map[string]int{"a": 3, "b": 5, "c": 6})
+	if p := r.Round.Ranking()[0]; p.Time != 2*time.Minute+time.Second {
+		t.Errorf("c reached 6 at %v", p.Time)
+	}
+}
+
+func TestSurvivalTiesGoToWhoGotThereFirst(t *testing.T) {
+	r := startedIn(t, games.WhosThat, "b")
+	run(t, r, "a", 3, true, play(30*time.Second))
+	run(t, r, "b", 3, true, play(40*time.Second))
+	// Nobody's left going.
+	wantFinished(t, r, play(41*time.Second), "a")
+	wantRanking(t, r.Round, place{"a", 1, Out}, place{"b", 2, Out})
+}
+
+func TestSurvivalNothingAllRoundIsADraw(t *testing.T) {
+	r := startedIn(t, games.HigherLower, "b")
+	must(t, r.Answer("a", false, play(time.Second)))
+	must(t, r.Answer("b", false, play(2*time.Second)))
+	wantFinished(t, r, play(2*time.Second), "")
+	wantRanking(t, r.Round, place{"a", 1, Out}, place{"b", 1, Out})
+}
+
+func TestSurvivalTimeLimit(t *testing.T) {
+	r := startedIn(t, games.HigherLower, "b")
+	run(t, r, "a", 10, false, play(4*time.Minute))
+	run(t, r, "b", 12, false, play(4*time.Minute+30*time.Second))
+	if r.Advance(play(RoundLength - time.Millisecond)) {
+		t.Fatal("ended early")
+	}
+	r.Advance(play(RoundLength))
+	wantFinished(t, r, play(RoundLength), "b")
+	wantRanking(t, r.Round, place{"b", 1, Standing}, place{"a", 2, Standing})
+}
+
+func TestSurvivalNoFinishWindow(t *testing.T) {
+	r := startedIn(t, games.HigherLower, "b")
+	run(t, r, "a", 1, false, play(time.Second))
+	if !r.Round.EndsAt.Equal(play(RoundLength)) {
+		t.Errorf("a right answer moved the end to %v", r.Round.EndsAt.Sub(t0))
+	}
+}
+
+func TestSurvivalForfeitKeepsTheStreak(t *testing.T) {
+	r := startedIn(t, games.WhosThat, "b")
+	run(t, r, "a", 4, false, play(time.Minute))
+	must(t, r.Forfeit("a", play(61*time.Second)))
+	// b is behind: they play on, and fall short.
+	run(t, r, "b", 3, true, play(2*time.Minute))
+	wantFinished(t, r, play(2*time.Minute+time.Second), "a")
+	wantRanking(t, r.Round, place{"a", 1, Forfeited}, place{"b", 2, Out})
+}
+
+func TestSurvivalGraceRunningOut(t *testing.T) {
+	r := startedIn(t, games.HigherLower, "b")
+	r.Disconnect("b", play(10*time.Second))
+	r.Advance(play(10*time.Second + Grace))
+	// Both on 0: a isn't ahead yet.
+	if r.Status != Playing {
+		t.Fatal("ended with nobody ahead")
+	}
+	must(t, r.Answer("a", true, play(time.Minute)))
+	wantFinished(t, r, play(time.Minute), "a")
+	wantRanking(t, r.Round, place{"a", 1, Standing}, place{"b", 2, Forfeited})
+}
+
+func TestEachModeTakesItsOwnMoves(t *testing.T) {
+	r := startedIn(t, games.HigherLower, "b")
+	wantErr(t, r.Guess("a", true, play(time.Second)), ErrWrongMove)
+	wantErr(t, r.CanMove("a", games.Wordle, play(time.Second)), ErrWrongMove)
+	must(t, r.CanMove("a", games.WhosThat, play(time.Second)))
+
+	w := started(t, "b")
+	wantErr(t, w.Answer("a", true, play(time.Second)), ErrWrongMove)
+	if !IsRuleError(ErrWrongMove) {
+		t.Error("ErrWrongMove isn't a rule error")
+	}
+}
+
+func TestSettings(t *testing.T) {
+	r := lobby(t, "b")
+	wantErr(t, r.SetSettings("b", games.WhosThat, games.AllGens, t0), ErrNotHost)
+	must(t, r.SetSettings("a", games.WhosThat, games.AllGens, t0))
+	if m, _ := r.Member("b"); r.Mode != games.WhosThat || m.Ready {
+		t.Errorf("mode %s, b ready %v; want whos_that and b unreadied", r.Mode, m.Ready)
+	}
+	// "" keeps the mode; the same settings unready nobody.
+	must(t, r.SetReady("b", true, t0))
+	must(t, r.SetSettings("a", "", games.AllGens, t0))
+	if m, _ := r.Member("b"); r.Mode != games.WhosThat || !m.Ready {
+		t.Errorf("mode %s, b ready %v after no change", r.Mode, m.Ready)
+	}
+}

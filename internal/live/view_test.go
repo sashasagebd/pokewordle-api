@@ -134,3 +134,42 @@ func TestMembers(t *testing.T) {
 		t.Error("a player has the same public ID in two rooms")
 	}
 }
+
+func TestASurvivalRaceShowsStreaks(t *testing.T) {
+	r := rooms.New("room-3", "K7QX2P", alice, "Alice", games.AllGens, t0)
+	must(t, r.Connect(alice, t0))
+	must(t, r.Join(bob, "Bob", t0))
+	must(t, r.Connect(bob, t0))
+	must(t, r.SetSettings(alice, games.WhosThat, games.AllGens, t0))
+	must(t, r.SetReady(bob, true, t0))
+	must(t, r.Start(alice, 25, t0))
+	play := t0.Add(rooms.Countdown)
+	must(t, r.Answer(alice, true, play.Add(time.Second)))
+	must(t, r.Answer(alice, true, play.Add(2*time.Second)))
+
+	states := map[string]games.State{
+		alice: {ID: "game-a", Mode: games.WhosThat, Status: games.Active, Score: 2, Round: &games.PublicRound{N: 3}},
+		bob:   {ID: "game-b", Mode: games.WhosThat, Status: games.Active, Round: &games.PublicRound{N: 1}},
+	}
+	v := ViewFor(r, states, bob)
+	if v.Mode != games.WhosThat || v.Round.Mode != games.WhosThat {
+		t.Errorf("modes %s, %s", v.Mode, v.Round.Mode)
+	}
+	if a := v.Round.Players[0]; a.ID != PublicID(r.ID, alice) || a.Score != 2 || !a.Racing || a.EndedOn != nil || len(a.Tiles) != 0 {
+		t.Errorf("alice mid-round, as bob sees her: %+v", a)
+	}
+
+	// Bob misses: alice is ahead and alone, so she's won.
+	must(t, r.Answer(bob, false, play.Add(3*time.Second)))
+	missed := pokedex.Pokemon{ID: 25, Name: "pikachu"}
+	onto := pokedex.Pokemon{ID: 6, Name: "charizard"}
+	states[bob] = games.State{ID: "game-b", Mode: games.WhosThat, Status: games.Lost, Answer: &missed}
+	states[alice] = games.State{ID: "game-a", Mode: games.WhosThat, Status: games.Lost, Score: 2, Answer: &onto}
+	v = ViewFor(r, states, bob)
+	if v.Round.FinishedAt == nil || v.Round.Winner != PublicID(r.ID, alice) || v.Round.Answer != nil {
+		t.Fatalf("after bob's miss: %+v", v.Round)
+	}
+	if b := v.Round.Players[1]; b.Outcome != rooms.Out || b.EndedOn == nil || b.EndedOn.Name != "pikachu" {
+		t.Errorf("bob in the results: %+v", b)
+	}
+}

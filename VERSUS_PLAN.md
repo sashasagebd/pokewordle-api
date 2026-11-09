@@ -1,7 +1,7 @@
 # Versus: real-time multiplayer rooms
 
-The plan for Phase 5: friends race each other at the same Wordle in a room
-they join with a code, see each other's progress live, and the server decides
+The plan for Phase 5: friends race each other at the same game (any of the
+three modes) in a room they join with a code, see each other's progress live, and the server decides
 who won. It builds on what's already here: Wordle games run server-side by
 `games.Engine`, kept in Postgres, each move a transaction with the game's row
 locked, retries made harmless by the round number `n`.
@@ -14,12 +14,14 @@ Code paths are in this repo; phase 4 is in the frontend,
 - [x] **1. Rules:** `internal/rooms`, the pure rules of a room (no database, no clock), with tests
 - [x] **2. Store:** migration, `rooms.Store`, socket tickets, solo games ignoring room games, cleanup
 - [x] **3. Sockets:** `/rooms` endpoints, `/ws`, a hub per instance (`internal/live`), `LISTEN`/`NOTIFY` between instances, closing with 1012 on shutdown
-- [ ] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch
-- [ ] **5. Resilience:** prove it end to end: an instance stopped mid-round, its clients carrying on through the other; then a real deploy. (Grace, forfeits, expiry, 1012 on shutdown and reconnecting for the latest room are built.)
-- [ ] **6. Load and observability:** a bot load generator, per-room logs, latency numbers in the README
+- [x] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch (in `pokewordle`: `/versus`, `useRoom`)
+- [x] **5. Every mode:** Higher or Lower and Who's That in rooms too, as survival races over the same Pokémon ([below](#every-mode))
+- [ ] **6. Resilience:** prove it end to end: an instance stopped mid-round, its clients carrying on through the other; then a real deploy. (Grace, forfeits, expiry, 1012 on shutdown and reconnecting for the latest room are built.)
+- [ ] **7. Load and observability:** a bot load generator, per-room logs, latency numbers in the README
 - [ ] **Later:** a quick-match queue (it just pairs two players into a room), ping-compensated times, ratings
 
-Phases 1 to 4 make it playable; 5 and 6 make it solid.
+Phases 1 to 4 make it playable, 5 makes it every game, and 6 and 7 make it
+solid.
 
 ## How it plays
 
@@ -47,6 +49,61 @@ Phases 1 to 4 make it playable; 5 and 6 make it solid.
    next one.
 
 Room games don't count toward solo best scores or leaderboards.
+
+## Every mode
+
+The host picks the mode in the lobby, with the generations (changing either
+unreadies everyone). PokéWordle plays as above. Higher or Lower and Who's
+That are streak games, so in a room they're a **survival race**:
+
+1. **Everyone gets the same Pokémon in the same order**, however fast each
+   goes: in Higher or Lower the same pairs, in Who's That the same
+   silhouettes. Each player still chooses height or weight per pair, as in
+   solo.
+2. **A wrong answer ends your run.** Your streak is your score. Giving up,
+   or your grace running out, ends it too, keeping the streak.
+3. **The longest streak wins**, ties going to whoever reached it first.
+   A streak of 0 all round is a draw.
+4. **The round ends** when everyone's run is over, at the time limit
+   (5 minutes, as now), or as soon as the only one still going is ahead of
+   everyone else: they've won, and nothing they do now changes a place. One
+   still going but behind the leader plays on, to catch them or not. No
+   finish window: that was so Wordle's winner isn't kept waiting.
+5. **You see each opponent's streak and whether they're still going**,
+   never their answers: in Who's That, someone's right answer *is* the
+   answer to the same silhouette you're looking at. Once the round ends,
+   the results show each run's streak and the Pokémon it ended on.
+
+### What changes
+
+- **Rules** (`internal/rooms`): a room and each round have a mode. A
+  player's race gains a score, when they reached it, and when their run
+  ended. `Answer(player, correct, now)` is the streak mode's move, beside
+  Wordle's `Guess`. Ranking, the winner and the round's end are per mode;
+  Wordle's stay as they are.
+- **The same sequence for everyone:** a round stores a random seed, and
+  round *k* of each player's game draws its Pokémon from the seed and *k*
+  alone (still never repeating the one before), so players at different
+  speeds meet the same ones. `games.Engine` gets a seeded way to add rounds.
+- **Schema:** [0006_versus_modes.sql](internal/db/migrations/0006_versus_modes.sql)
+  (0005 is deployed, so it stays as it is): `rooms.mode` (default `wordle`,
+  so existing rooms keep working), `room_rounds.mode` and `seed`,
+  `room_round_players.score`, `scored_at` and `out_at`, and `games.seed`.
+- **Who's That silhouettes** come from the existing
+  `GET /games/{id}/rounds/{n}/image`, which already only serves your own
+  game's open round and the one after it.
+- **Socket:** `settings` gains `mode`; streak moves are
+  `{"type": "answer", "n", "dir", "stat"}` (Higher or Lower) or
+  `{"type": "answer", "n", "name"}` (Who's That), with `n` the round
+  answered, as in solo.
+- **Views:** each player shows `score`, `racing` and, once it's over,
+  `endedOn`. `game` is your own game as its solo mode shows it.
+- **Frontend:** a mode picker in the lobby; the race screens reuse the solo
+  modes' pieces (the pair and its buttons, the silhouette and its search)
+  beside the standings.
+- **Tests:** rules for survival races (ties on time, the last one standing
+  ahead or behind, the time limit), the seeded sequence being the same for
+  every player whatever their pace, and a two-instance socket test per mode.
 
 ## Architecture
 
@@ -156,25 +213,28 @@ again (a room is small). A client keeps the one with the highest `seq`.
 | Client → server | |
 |---|---|
 | `{"type": "ready", "ready": true}` | Lobby |
-| `{"type": "settings", "gens": [1, 2]}` | Host, lobby; unreadies everyone |
+| `{"type": "settings", "mode": "whos_that", "gens": [1, 2]}` | Host, lobby; unreadies everyone. No `mode` keeps it |
 | `{"type": "start"}` | Host, everyone else ready |
-| `{"type": "guess", "n": 1, "name": "pikachu"}` | `n` counts your guesses from 1, so a resend is refused, not played twice |
+| `{"type": "guess", "n": 1, "name": "pikachu"}` | Wordle. `n` counts your guesses from 1, so a resend is refused, not played twice |
+| `{"type": "answer", "n", "dir", "stat"}` or `{"type": "answer", "n", "name"}` | Higher or Lower, or Who's That: `n` is the round answered, as in solo |
 | `{"type": "forfeit"}`, `{"type": "leave"}` | |
 
 | Server → client | |
 |---|---|
 | `{"type": "room", "seq", "serverNow", "room"}` | On opening and every change: the room as you may see it (below) |
 | `{"type": "guess", "n", "result", "game"}` | Your guess's comparison and your game, as solo Wordle answers |
+| `{"type": "answer", "n", "correct", "answer", "game"}` | Your answer's result, the Pokémon revealed and your game, as solo answers |
 | `{"type": "error", "for", "n", "error"}` | A message that couldn't be acted on; `error` is meant for the player |
 
-The room: `code`, `status` (`lobby`, `playing`, `closed`), `gens`, `you`
+The room: `code`, `status` (`lobby`, `playing`, `closed`), `mode`, `gens`, `you`
 and `host` (public IDs: stable in the room, never a player ID), `members`
 (`id`, `name`, `ready`, `connected`, `graceEndsAt`), and `round`, the one
-being played or the last: `n`, `startsAt` (the end of the countdown),
-`endsAt`, `finishedAt`, `players` in their places (`id`, `name`, `rank`,
-`outcome`, `racing`, `guesses`, `timeMs`, `tiles` without the Pokémon, and
-once it's over `comparisons` in full), `winner`, `answer` once it's over,
-and `game`, your own race as solo Wordle shows it. Times are the server's;
+being played or the last: `n`, `mode`, `startsAt` (the end of the
+countdown), `endsAt`, `finishedAt`, `players` in their places (`id`,
+`name`, `rank`, `outcome`, `racing`, `timeMs`; Wordle: `guesses`, `tiles`
+without the Pokémon, and once it's over `comparisons` in full; the streak
+modes: `score`, and once it's over `endedOn`), `winner`, Wordle's `answer`
+once it's over, and `game`, your own race as its solo mode shows it. Times are the server's;
 `serverNow` gives the client its clock's offset.
 
 Close codes: 1012 the server is restarting (reconnect), 4000 the room has

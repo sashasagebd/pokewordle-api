@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/sashasagebd/pokewordle-api/internal/games"
+	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
 	"github.com/sashasagebd/pokewordle-api/internal/rooms"
 )
 
@@ -43,6 +44,14 @@ type (
 		ServerNow time.Time `json:"serverNow"`
 		Room      View      `json:"room"`
 	}
+	// answerMsg answers a streak-mode answer, to the player only.
+	answerMsg struct {
+		Type    string          `json:"type"` // "answer"
+		N       int             `json:"n"`
+		Correct bool            `json:"correct"`
+		Answer  pokedex.Pokemon `json:"answer"`
+		Game    games.State     `json:"game"`
+	}
 	// guessMsg answers a guess, to the guesser only.
 	guessMsg struct {
 		Type   string           `json:"type"` // "guess"
@@ -64,9 +73,12 @@ type (
 type inbound struct {
 	Type  string `json:"type"`
 	Ready bool   `json:"ready"` // "ready"
+	Mode  string `json:"mode"`  // "settings" ("" keeps it)
 	Gens  []int  `json:"gens"`  // "settings"
-	N     int    `json:"n"`     // "guess"
-	Name  string `json:"name"`  // "guess"
+	N     int    `json:"n"`     // "guess", "answer"
+	Name  string `json:"name"`  // "guess", "answer" (Who's That)
+	Dir   string `json:"dir"`   // "answer" (Higher or Lower)
+	Stat  string `json:"stat"`  // "answer" (Higher or Lower)
 }
 
 // A socket is one client's connection to a room.
@@ -164,18 +176,19 @@ func (s *socket) handle(ctx context.Context, m inbound) {
 	case "ready":
 		_, err = store.SetReady(ctx, s.player, s.roomID, m.Ready)
 	case "settings":
-		var mask games.GenMask
-		if mask, err = games.MaskOf(m.Gens); err == nil {
-			_, err = store.SetGens(ctx, s.player, s.roomID, mask)
-		} else {
-			err = &games.InputError{Msg: err.Error()}
-		}
+		err = s.settings(ctx, m)
 	case "start":
 		_, err = store.Start(ctx, s.player, s.roomID)
 	case "guess":
 		var res rooms.GuessResult
 		if res, _, err = store.Guess(ctx, s.player, s.roomID, m.N, m.Name); err == nil {
 			s.send(guessMsg{Type: "guess", N: m.N, Result: res.Comparison, Game: res.Game})
+		}
+	case "answer":
+		var res rooms.AnswerResult
+		a := games.Answer{N: m.N, Dir: m.Dir, Stat: m.Stat, Name: m.Name}
+		if res, _, err = store.Answer(ctx, s.player, s.roomID, a); err == nil {
+			s.send(answerMsg{Type: "answer", N: m.N, Correct: res.Correct, Answer: res.Answer, Game: res.Game})
 		}
 	case "forfeit":
 		_, err = store.Forfeit(ctx, s.player, s.roomID)
@@ -202,6 +215,23 @@ func (s *socket) handle(ctx context.Context, m inbound) {
 	if errors.Is(err, rooms.ErrNotMember) || errors.Is(err, rooms.ErrClosed) {
 		s.closeFor(err)
 	}
+}
+
+// settings changes the room's mode (unless m leaves it out) and generations.
+func (s *socket) settings(ctx context.Context, m inbound) error {
+	var mode games.Mode
+	if m.Mode != "" {
+		var err error
+		if mode, err = games.ParseMode(m.Mode); err != nil {
+			return &games.InputError{Msg: err.Error()}
+		}
+	}
+	mask, err := games.MaskOf(m.Gens)
+	if err != nil {
+		return &games.InputError{Msg: err.Error()}
+	}
+	_, err = s.hub.rooms.SetSettings(ctx, s.player, s.roomID, mode, mask)
+	return err
 }
 
 // playerMessage returns what to tell the player about err, if it's their

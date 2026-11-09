@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	mrand "math/rand/v2"
 	"regexp"
 	"time"
@@ -171,7 +172,13 @@ func (s *Store) SetReady(ctx context.Context, player, id string, ready bool) (*R
 
 // SetGens changes room id's generations (the host only).
 func (s *Store) SetGens(ctx context.Context, player, id string, mask games.GenMask) (*Room, error) {
-	return s.simple(ctx, id, func(r *Room, now time.Time) error { return r.SetGens(player, mask, now) })
+	return s.SetSettings(ctx, player, id, "", mask)
+}
+
+// SetSettings changes room id's mode ("" keeps it) and generations (the host
+// only).
+func (s *Store) SetSettings(ctx context.Context, player, id string, mode games.Mode, mask games.GenMask) (*Room, error) {
+	return s.simple(ctx, id, func(r *Room, now time.Time) error { return r.SetSettings(player, mode, mask, now) })
 }
 
 // Forfeit gives up the round for player in room id.
@@ -185,23 +192,26 @@ func (s *Store) Tick(ctx context.Context, id string) (*Room, bool, error) {
 	return s.change(ctx, id, func(pgx.Tx, *Room, time.Time) (bool, error) { return false, nil })
 }
 
-// Start begins a round in room id (the host only): a random answer from the
-// room's generations, and a Wordle game with it for every player.
+// Start begins a round in room id (the host only), in the room's mode: a
+// random seed, and a game for every player with its Pokémon drawn from it,
+// so they all meet the same ones.
 func (s *Store) Start(ctx context.Context, player, id string) (*Room, error) {
 	room, _, err := s.change(ctx, id, func(tx pgx.Tx, r *Room, now time.Time) (bool, error) {
-		if err := r.Start(player, s.games.Pick(r.Mask), now); err != nil {
+		seed := mrand.Int64N(math.MaxInt64) + 1 // 0 means unseeded
+		if err := r.Start(player, s.games.FirstAnswer(r.Mode, r.Mask, seed), now); err != nil {
 			return false, err
 		}
 		rd := r.Round
+		rd.Seed = seed
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO room_rounds (room_id, n, answer_id, starts_at, ends_at)
-			VALUES ($1::uuid, $2, $3, $4, $5) RETURNING id::text`,
-			r.ID, rd.N, rd.AnswerID, rd.StartsAt, rd.EndsAt).Scan(&rd.ID); err != nil {
+			INSERT INTO room_rounds (room_id, n, mode, seed, answer_id, starts_at, ends_at)
+			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7) RETURNING id::text`,
+			r.ID, rd.N, rd.Mode, rd.Seed, rd.AnswerID, rd.StartsAt, rd.EndsAt).Scan(&rd.ID); err != nil {
 			return false, err
 		}
 		for i := range rd.Players {
 			p := &rd.Players[i]
-			gameID, err := s.games.StartInRound(ctx, tx, p.PlayerID, rd.ID, r.Mask, rd.AnswerID)
+			gameID, err := s.games.StartInRound(ctx, tx, p.PlayerID, rd.ID, rd.Mode, r.Mask, rd.Seed)
 			if err != nil {
 				return false, err
 			}
@@ -231,7 +241,7 @@ func (s *Store) Guess(ctx context.Context, player, id string, n int, name string
 	var res GuessResult
 	room, _, err := s.change(ctx, id, func(tx pgx.Tx, r *Room, now time.Time) (bool, error) {
 		// Asked first, so a guess the room would refuse is never played.
-		if err := r.CanMove(player, now); err != nil {
+		if err := r.CanMove(player, games.Wordle, now); err != nil {
 			return false, err
 		}
 		c, st, err := s.games.GuessInRound(ctx, tx, player, r.player(player).GameID, n, name)
@@ -240,6 +250,32 @@ func (s *Store) Guess(ctx context.Context, player, id string, n int, name string
 		}
 		res = GuessResult{c, st}
 		return true, r.Guess(player, c.Correct, now)
+	})
+	return res, room, err
+}
+
+// An AnswerResult is a streak-mode Versus answer as its player sees it: the
+// same as a solo answer.
+type AnswerResult struct {
+	games.AnswerResult
+	Game games.State
+}
+
+// Answer plays player's answer in room id's streak round: a.N is the round
+// it answers, as in solo, so a resend is games.ErrWrongRound. A right answer
+// adds to their streak; a wrong one ends their run.
+func (s *Store) Answer(ctx context.Context, player, id string, a games.Answer) (AnswerResult, *Room, error) {
+	var res AnswerResult
+	room, _, err := s.change(ctx, id, func(tx pgx.Tx, r *Room, now time.Time) (bool, error) {
+		if err := r.CanMove(player, games.HigherLower, now); err != nil {
+			return false, err
+		}
+		ar, st, err := s.games.AnswerInRound(ctx, tx, player, r.player(player).GameID, a)
+		if err != nil {
+			return false, err
+		}
+		res = AnswerResult{ar, st}
+		return true, r.Answer(player, ar.Correct, now)
 	})
 	return res, room, err
 }
@@ -351,14 +387,14 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 	if !uuidPattern.MatchString(id) {
 		return nil, ErrNotFound
 	}
-	q := `SELECT id::text, code, coalesce(host_id::text, ''), gen_mask, status, last_activity_at, seq
+	q := `SELECT id::text, code, coalesce(host_id::text, ''), mode, gen_mask, status, last_activity_at, seq
 		FROM rooms WHERE id = $1::uuid`
 	if lock {
 		q += ` FOR UPDATE`
 	}
 	r := &Room{}
 	var mask int16
-	err := tx.QueryRow(ctx, q, id).Scan(&r.ID, &r.Code, &r.Host, &mask, &r.Status, &r.LastActivity, &r.Seq)
+	err := tx.QueryRow(ctx, q, id).Scan(&r.ID, &r.Code, &r.Host, &r.Mode, &mask, &r.Status, &r.LastActivity, &r.Seq)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -397,9 +433,9 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 	rd := &Round{}
 	var finished *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id::text, n, answer_id, starts_at, ends_at, finished_at FROM room_rounds
+		SELECT id::text, n, mode, coalesce(seed, 0), answer_id, starts_at, ends_at, finished_at FROM room_rounds
 		WHERE room_id = $1::uuid ORDER BY n DESC LIMIT 1`, id).
-		Scan(&rd.ID, &rd.N, &rd.AnswerID, &rd.StartsAt, &rd.EndsAt, &finished)
+		Scan(&rd.ID, &rd.N, &rd.Mode, &rd.Seed, &rd.AnswerID, &rd.StartsAt, &rd.EndsAt, &finished)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if r.Status == Playing {
 			return nil, fmt.Errorf("room %s is playing without a round", id)
@@ -411,18 +447,18 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 	}
 	rd.FinishedAt = orZero(finished)
 	rows, err = tx.Query(ctx, `
-		SELECT player_id::text, name, game_id::text, guesses, solved_at, forfeited_at FROM room_round_players
-		WHERE round_id = $1::uuid ORDER BY position`, rd.ID)
+		SELECT player_id::text, name, game_id::text, guesses, solved_at, score, scored_at, out_at, forfeited_at
+		FROM room_round_players WHERE round_id = $1::uuid ORDER BY position`, rd.ID)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var p Player
-		var solved, forfeited *time.Time
-		if err := rows.Scan(&p.PlayerID, &p.Name, &p.GameID, &p.Guesses, &solved, &forfeited); err != nil {
+		var solved, scored, out, forfeited *time.Time
+		if err := rows.Scan(&p.PlayerID, &p.Name, &p.GameID, &p.Guesses, &solved, &p.Score, &scored, &out, &forfeited); err != nil {
 			return nil, err
 		}
-		p.SolvedAt, p.ForfeitedAt = orZero(solved), orZero(forfeited)
+		p.SolvedAt, p.ScoredAt, p.OutAt, p.ForfeitedAt = orZero(solved), orZero(scored), orZero(out), orZero(forfeited)
 		rd.Players = append(rd.Players, p)
 	}
 	if err := rows.Err(); err != nil {
@@ -436,10 +472,10 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 // them), bumps its seq and announces the change.
 func save(ctx context.Context, tx pgx.Tx, r *Room) error {
 	if err := tx.QueryRow(ctx, `
-		UPDATE rooms SET host_id = nullif($2, '')::uuid, gen_mask = $3, status = $4,
-			last_activity_at = $5, seq = seq + 1
+		UPDATE rooms SET host_id = nullif($2, '')::uuid, mode = $3, gen_mask = $4, status = $5,
+			last_activity_at = $6, seq = seq + 1
 		WHERE id = $1::uuid RETURNING seq`,
-		r.ID, r.Host, int16(r.Mask), r.Status, r.LastActivity).Scan(&r.Seq); err != nil {
+		r.ID, r.Host, r.Mode, int16(r.Mask), r.Status, r.LastActivity).Scan(&r.Seq); err != nil {
 		return err
 	}
 
@@ -470,9 +506,11 @@ func save(ctx context.Context, tx pgx.Tx, r *Room) error {
 		}
 		for _, p := range rd.Players {
 			if _, err := tx.Exec(ctx, `
-				UPDATE room_round_players SET guesses = $3, solved_at = $4, forfeited_at = $5
+				UPDATE room_round_players SET guesses = $3, solved_at = $4,
+					score = $5, scored_at = $6, out_at = $7, forfeited_at = $8
 				WHERE round_id = $1::uuid AND player_id = $2::uuid`,
-				rd.ID, p.PlayerID, p.Guesses, nullTime(p.SolvedAt), nullTime(p.ForfeitedAt)); err != nil {
+				rd.ID, p.PlayerID, p.Guesses, nullTime(p.SolvedAt),
+				p.Score, nullTime(p.ScoredAt), nullTime(p.OutAt), nullTime(p.ForfeitedAt)); err != nil {
 				return err
 			}
 		}
