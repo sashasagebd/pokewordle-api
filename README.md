@@ -211,7 +211,11 @@ prints a row for this table:
 
 | Date | Where | Mode | Rooms | Sockets | Moves/s | Reply p50 | p95 | p99 | Broadcast p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | |
+| 2026-11-08 | home server, from a home PC through Cloudflare | Higher or Lower | 20 | 40 | 6.7 | 40 ms | 83 ms | 86 ms | 57 ms | 76 ms | 80 ms | 91 ms |
+
+The times include the client's own round trip to Cloudflare and on to the
+server, so they're what a player would see. 1,201 broadcasts measured over 3
+minutes, with no reconnects.
 
 ### What the logs say
 
