@@ -189,6 +189,44 @@ each bot's reconnects (a deploy causes one each). At the end it lists any
 problems, exiting 1 if there were: a move never answered, an unexpected
 error, a room going back to an older version, or a bot losing the room.
 
+## Load testing
+
+[cmd/versusload](cmd/versusload/main.go) plays many Versus rooms at once,
+two bots in each, and times how long moves take to get around:
+
+- **reply:** a bot's move until its answer comes back
+- **broadcast:** a bot's move until the other bot sees it: the commit, the
+  `NOTIFY`, the hub reloading the room, and the other socket. That's what an
+  opponent waits for.
+
+```sh
+go run ./cmd/versusload -api http://localhost:8080 -rooms 50 -for 3m
+```
+
+The rate limits are per address, so from one machine it makes a few players
+(`-players`, 4 by default) and puts them in many rooms each, and opens the
+rooms as fast as the limits allow (2 joins and tickets a second: about 3
+seconds a room). Measuring starts once every room is open. At the end it
+prints a row for this table:
+
+| Date | Where | Mode | Rooms | Sockets | Moves/s | Reply p50 | p95 | p99 | Broadcast p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | |
+
+### What the logs say
+
+- `room made`, `round started`, `round finished` (with the winner, what
+  ended it, `time` or `decided`, and its length) and `room closed`, each
+  with the room's code. They're logged by the instance that made the
+  change, once it's committed.
+- `hub stats`, once a minute from each instance with sockets or sends: its
+  sockets and rooms, changes heard about, room versions sent, and the
+  fanout: from a change's commit to its sends being queued there (p50, p99,
+  max). A slow fanout with a fast database points at the hub; both slow, at
+  the database.
+- Each hub's `LISTEN` connection is named `pokewordle-api hub` in
+  `pg_stat_activity`.
+
 ## Configuration
 
 | Variable | Default | What |

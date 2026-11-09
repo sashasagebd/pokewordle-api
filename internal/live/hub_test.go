@@ -31,6 +31,7 @@ type instance struct {
 	url  string
 	pool *pgxpool.Pool
 	dex  *games.Dex
+	hub  *live.Hub
 	stop func() // stops the hub, as a shutdown does
 }
 
@@ -63,7 +64,7 @@ func start(t *testing.T) *instance {
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(stop) // first: sockets close before the server and pool
-	return &instance{srv.URL, pool, dex, stop}
+	return &instance{srv.URL, pool, dex, hub, stop}
 }
 
 // post sends a JSON request and decodes the answer into out, failing the

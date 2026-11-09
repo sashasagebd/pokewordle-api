@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +45,76 @@ type Hub struct {
 	byRoom  map[string]*roomConns
 	closing bool
 	sockets sync.WaitGroup // every socket's handler
+	stats   hubStats       // since the last report, under mu
+}
+
+// hubStats are what a hub has done since its last report.
+type hubStats struct {
+	notifications int             // changes heard about
+	sent          int             // room versions sent to sockets
+	fanout        []time.Duration // from a change's commit to its sends being queued
+}
+
+// HubStats are a hub's numbers since its last report (Stats).
+type HubStats struct {
+	Sockets, Rooms, Notifications, Sent int
+	// Fanout is, for each change sent, the time from its commit (as the
+	// committing instance's clock had it) to its sends being queued here.
+	Fanout []time.Duration
+}
+
+// Stats returns the hub's numbers since its last report, without resetting
+// them.
+func (h *Hub) Stats() HubStats {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.statsLocked()
+}
+
+func (h *Hub) statsLocked() HubStats {
+	st := HubStats{Rooms: len(h.byRoom), Notifications: h.stats.notifications, Sent: h.stats.sent, Fanout: slices.Clone(h.stats.fanout)}
+	for _, rc := range h.byRoom {
+		st.Sockets += len(rc.sockets)
+	}
+	return st
+}
+
+// reportEvery is how often a hub logs its numbers (when it has any).
+const reportEvery = time.Minute
+
+// report logs the hub's numbers every reportEvery, and starts them afresh.
+func (h *Hub) report() {
+	t := time.NewTicker(reportEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-t.C:
+		}
+		h.mu.Lock()
+		st := h.statsLocked()
+		h.stats = hubStats{}
+		h.mu.Unlock()
+		if st.Sockets == 0 && st.Sent == 0 {
+			continue // nothing to say
+		}
+		slices.Sort(st.Fanout)
+		slog.Info("hub stats", "sockets", st.Sockets, "rooms", st.Rooms,
+			"notifications", st.Notifications, "sent", st.Sent,
+			"fanout_p50_ms", quantile(st.Fanout, 0.5).Milliseconds(),
+			"fanout_p99_ms", quantile(st.Fanout, 0.99).Milliseconds(),
+			"fanout_max_ms", quantile(st.Fanout, 1).Milliseconds())
+	}
+}
+
+// quantile is the q quantile of sorted d, or 0 if it's empty.
+func quantile(d []time.Duration, q float64) time.Duration {
+	if len(d) == 0 {
+		return 0
+	}
+	i := int(q*float64(len(d))+0.5) - 1
+	return d[min(max(i, 0), len(d)-1)]
 }
 
 // roomConns are the sockets to one room here. At most one worker at a time
@@ -53,6 +125,9 @@ type roomConns struct {
 	pending bool // a change to send that the worker hasn't loaded yet
 	running bool // the worker is on it
 	timer   *time.Timer
+	// notedAt is when the earliest change pending was committed, from its
+	// notification: zero for none (or a resend with no change behind it).
+	notedAt time.Time
 }
 
 // NewHub returns a hub for rooms in store, with each race a game in gs. It
@@ -69,6 +144,7 @@ func (h *Hub) Run() {
 	var wg sync.WaitGroup
 	wg.Go(h.listen)
 	wg.Go(h.sweep)
+	wg.Go(h.report)
 	<-h.ctx.Done()
 	wg.Wait()
 
@@ -127,8 +203,11 @@ func (h *Hub) listenOnce() error {
 		if err != nil {
 			return err
 		}
-		id, _, _ := strings.Cut(n.Payload, ":")
-		h.schedule(id)
+		id, at := parseNotification(n.Payload)
+		h.mu.Lock()
+		h.stats.notifications++
+		h.mu.Unlock()
+		h.schedule(id, at)
 	}
 }
 
@@ -189,7 +268,7 @@ func (h *Hub) register(s *socket) bool {
 		}
 	}
 	// The new socket needs the room even if connecting changed nothing.
-	h.schedule(s.roomID)
+	h.schedule(s.roomID, time.Time{})
 	return true
 }
 
@@ -246,7 +325,8 @@ func (rc *roomConns) has(player string) bool {
 
 // schedule has room id's latest state sent to its sockets here, if it has
 // any. Changes that arrive while one is being sent are sent together after.
-func (h *Hub) schedule(id string) {
+// committed is when the change was, if it's known (for the fanout numbers).
+func (h *Hub) schedule(id string, committed time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	rc := h.byRoom[id]
@@ -254,6 +334,9 @@ func (h *Hub) schedule(id string) {
 		return
 	}
 	rc.pending = true
+	if !committed.IsZero() && (rc.notedAt.IsZero() || committed.Before(rc.notedAt)) {
+		rc.notedAt = committed
+	}
 	if !rc.running {
 		rc.running = true
 		go h.work(rc)
@@ -268,7 +351,7 @@ func (h *Hub) scheduleAll() {
 	}
 	h.mu.Unlock()
 	for _, id := range ids {
-		h.schedule(id)
+		h.schedule(id, time.Time{})
 	}
 }
 
@@ -281,8 +364,10 @@ func (h *Hub) work(rc *roomConns) {
 			return
 		}
 		rc.pending = false
+		committed := rc.notedAt
+		rc.notedAt = time.Time{}
 		h.mu.Unlock()
-		if err := h.refresh(rc); err != nil && h.ctx.Err() == nil {
+		if err := h.refresh(rc, committed); err != nil && h.ctx.Err() == nil {
 			slog.Error("sending a room's change", "room", rc.id, "err", err)
 		}
 	}
@@ -290,8 +375,9 @@ func (h *Hub) work(rc *roomConns) {
 
 // refresh loads the room and sends each socket here what its player may see
 // of it, unless it has seen this version already. It also sets the timer for
-// the room's next deadline.
-func (h *Hub) refresh(rc *roomConns) error {
+// the room's next deadline. committed is when the change it sends was
+// committed, if known: the time from then to the sends counts as fanout.
+func (h *Hub) refresh(rc *roomConns, committed time.Time) error {
 	room, err := h.rooms.Get(h.ctx, rc.id)
 	if errors.Is(err, rooms.ErrNotFound) {
 		h.closeAll(rc, CloseRoomClosed, "this room has closed")
@@ -330,6 +416,15 @@ func (h *Hub) refresh(rc *roomConns) error {
 	h.mu.Unlock()
 
 	now := time.Now()
+	sent := 0
+	defer func() {
+		h.mu.Lock()
+		h.stats.sent += sent
+		if sent > 0 && !committed.IsZero() {
+			h.stats.fanout = append(h.stats.fanout, time.Since(committed))
+		}
+		h.mu.Unlock()
+	}()
 	healed := map[string]bool{}
 	for _, s := range sockets {
 		m, ok := room.Member(s.player)
@@ -355,6 +450,7 @@ func (h *Hub) refresh(rc *roomConns) error {
 		if int64(room.Seq) > s.sentSeq.Load() {
 			s.sentSeq.Store(int64(room.Seq))
 			s.send(roomMsg{Type: "room", Seq: room.Seq, ServerNow: now, Room: ViewFor(room, states, s.player)})
+			sent++
 		}
 	}
 	if room.Status == rooms.Closed {
@@ -373,4 +469,17 @@ func (h *Hub) closeAll(rc *roomConns, code websocket.StatusCode, reason string) 
 	for _, s := range sockets {
 		s.close(code, reason)
 	}
+}
+
+// parseNotification reads a change's notification, "<room id>:<seq>" and,
+// from this version on, ":<commit time in Unix microseconds>". The time is
+// zero if it's missing (a version before) or unreadable.
+func parseNotification(payload string) (id string, committed time.Time) {
+	parts := strings.Split(payload, ":")
+	if len(parts) >= 3 {
+		if us, err := strconv.ParseInt(parts[2], 10, 64); err == nil {
+			committed = time.UnixMicro(us)
+		}
+	}
+	return parts[0], committed
 }

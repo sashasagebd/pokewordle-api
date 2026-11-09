@@ -173,3 +173,17 @@ func TestASurvivalRaceShowsStreaks(t *testing.T) {
 		t.Errorf("bob in the results: %+v", b)
 	}
 }
+
+func TestParseNotification(t *testing.T) {
+	at := time.UnixMicro(1_790_000_000_123_456)
+	for payload, want := range map[string]time.Time{
+		"room-1:12:1790000000123456": at,
+		"room-1:12":                  {}, // from a version before the time was added
+		"room-1:12:soon":             {},
+	} {
+		id, got := parseNotification(payload)
+		if id != "room-1" || !got.Equal(want) {
+			t.Errorf("parseNotification(%q) = %q, %v; want room-1, %v", payload, id, got, want)
+		}
+	}
+}
