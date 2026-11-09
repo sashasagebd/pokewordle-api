@@ -23,7 +23,9 @@ import (
 	"github.com/sashasagebd/pokewordle-api/internal/cleanup"
 	"github.com/sashasagebd/pokewordle-api/internal/db"
 	"github.com/sashasagebd/pokewordle-api/internal/games"
+	"github.com/sashasagebd/pokewordle-api/internal/live"
 	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
+	"github.com/sashasagebd/pokewordle-api/internal/rooms"
 )
 
 const defaultOrigins = "https://pokewordle.sashasagebd.com,https://pokewordle.sashasagebd.workers.dev,http://localhost:5173"
@@ -82,15 +84,25 @@ func run() error {
 	defer stop() // runs first: however run returns, the background work ends
 	background.Go(func() { cleanup.Run(ctx, pool, cleanup.Defaults, 3*time.Minute, time.Hour) })
 
+	// Versus: the hub pushes room changes to this instance's sockets until
+	// ctx ends, then closes them so their clients reconnect to the version
+	// taking over.
+	gameStore := games.NewStore(pool, &games.Engine{Dex: games.NewDex(seed)})
+	roomStore := rooms.NewStore(pool, gameStore)
+	hub := live.NewHub(ctx, pool, roomStore, gameStore)
+	background.Go(hub.Run)
+
 	addr := ":" + envOr("PORT", "8080")
 	srv := &http.Server{
 		Addr: addr,
 		Handler: api.New(api.Config{
 			Dex:            dex,
 			Players:        auth.NewStore(pool),
-			Games:          games.NewStore(pool, &games.Engine{Dex: games.NewDex(seed)}),
+			Games:          gameStore,
 			Silhouette:     pokedex.Silhouette,
 			AllowedOrigins: splitList(envOr("ALLOWED_ORIGINS", defaultOrigins)),
+			Rooms:          roomStore,
+			Sockets:        hub,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,

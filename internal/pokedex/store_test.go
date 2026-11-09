@@ -4,10 +4,44 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/sashasagebd/pokewordle-api/internal/dbtest"
 	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
 )
+
+// TestLoadLeavesMatchingRowsUnlocked: a version starting up loads the
+// Pokémon while the one before is still playing moves, which lock the
+// Pokémon their rounds refer to. Load must not wait for them (or worse,
+// deadlock with a move that wants a row it holds).
+func TestLoadLeavesMatchingRowsUnlocked(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.Pool(t)
+	s := pokedex.NewStore(pool)
+	seed, err := pokedex.Seed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold Pikachu as strongly as anything can.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM pokemon WHERE id = 25 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if n, err := s.Load(loadCtx, seed); err != nil || n != 0 {
+		t.Fatalf("Load with a matching row locked elsewhere: %d changed, %v; want 0 without waiting", n, err)
+	}
+}
 
 func TestStore(t *testing.T) {
 	ctx := context.Background()

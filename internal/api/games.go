@@ -215,7 +215,7 @@ func gameError(w http.ResponseWriter, r *http.Request, c Config, player string, 
 		writeError(w, http.StatusBadRequest, input.Msg)
 	case errors.Is(err, games.ErrNotFound):
 		writeError(w, http.StatusNotFound, "no such game")
-	case errors.Is(err, games.ErrOver):
+	case errors.Is(err, games.ErrOver), errors.Is(err, games.ErrRoomGame):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, games.ErrWrongRound):
 		// Most likely a retry of an answer that went through: send the game

@@ -25,13 +25,13 @@ func NewStore(pool *pgxpool.Pool, engine *Engine) *Store {
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // Start makes a new game for player. Any game of the same mode the player
-// still has going is abandoned.
+// still has going is abandoned (but not a Versus game: that's the room's).
 func (s *Store) Start(ctx context.Context, player string, mode Mode, mask GenMask) (State, error) {
 	g := s.engine.New(mode, mask)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			UPDATE games SET status = 'abandoned', updated_at = now()
-			WHERE player_id = $1::uuid AND mode = $2 AND status = 'active'`, player, mode); err != nil {
+			WHERE player_id = $1::uuid AND mode = $2 AND status = 'active' AND room_round_id IS NULL`, player, mode); err != nil {
 			return err
 		}
 		if err := tx.QueryRow(ctx, `
@@ -110,48 +110,109 @@ func (s *Store) SilhouetteOf(ctx context.Context, player, id string, n int) (int
 	return answerID, err
 }
 
-// move loads the game locked, lets play make a move (which returns the round
-// it answered, if any), and saves what changed: that round, rounds added
-// after it, and the game's status and score.
+// move plays a move on one of player's solo games: see moveIn. A Versus game
+// is refused (ErrRoomGame), since only its room may play it.
 func (s *Store) move(ctx context.Context, player, id string, play func(*Game) (*Round, error)) (State, error) {
 	var st State
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		g, err := load(ctx, tx, player, id, true)
-		if err != nil {
-			return err
-		}
-		before := len(g.Rounds)
-		answered, err := play(g)
-		if err != nil {
-			return err
-		}
-		if answered != nil {
-			if _, err := tx.Exec(ctx, `
-				UPDATE game_rounds SET
-					stat = nullif($3, ''), guess_id = nullif($4::int, 0), guess_dir = nullif($5, ''),
-					correct = $6, answered_at = now()
-				WHERE game_id = $1::uuid AND n = $2`,
-				g.ID, answered.N, answered.Stat, answered.GuessID, answered.GuessDir, answered.Correct); err != nil {
-				return err
-			}
-		}
-		if err := insertRounds(ctx, tx, g.ID, g.Rounds[before:]); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE games SET status = $2, score = $3, updated_at = now() WHERE id = $1::uuid`,
-			g.ID, g.Status, g.Score); err != nil {
-			return err
-		}
-		if improvesBest(g, answered) {
-			if err := recordBest(ctx, tx, player, g); err != nil {
-				return err
-			}
-		}
-		st = s.engine.State(g)
-		return nil
+		var err error
+		st, err = s.moveIn(ctx, tx, player, id, false, play)
+		return err
 	})
 	return st, err
+}
+
+// moveIn loads the game locked, lets play make a move (which returns the
+// round it answered, if any), and saves what changed: that round, rounds
+// added after it, and the game's status and score. It runs in tx, which a
+// Versus move shares with its room's changes. room says which kind of game
+// it must be.
+func (s *Store) moveIn(ctx context.Context, tx pgx.Tx, player, id string, room bool, play func(*Game) (*Round, error)) (State, error) {
+	g, err := load(ctx, tx, player, id, true)
+	if err != nil {
+		return State{}, err
+	}
+	if isRoom := g.RoomRound != ""; isRoom != room {
+		if isRoom {
+			return State{}, ErrRoomGame
+		}
+		return State{}, ErrNotFound // a bug in the room store
+	}
+	before := len(g.Rounds)
+	answered, err := play(g)
+	if err != nil {
+		return State{}, err
+	}
+	if answered != nil {
+		if _, err := tx.Exec(ctx, `
+			UPDATE game_rounds SET
+				stat = nullif($3, ''), guess_id = nullif($4::int, 0), guess_dir = nullif($5, ''),
+				correct = $6, answered_at = now()
+			WHERE game_id = $1::uuid AND n = $2`,
+			g.ID, answered.N, answered.Stat, answered.GuessID, answered.GuessDir, answered.Correct); err != nil {
+			return State{}, err
+		}
+	}
+	if err := insertRounds(ctx, tx, g.ID, g.Rounds[before:]); err != nil {
+		return State{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE games SET status = $2, score = $3, updated_at = now() WHERE id = $1::uuid`,
+		g.ID, g.Status, g.Score); err != nil {
+		return State{}, err
+	}
+	if improvesBest(g, answered) {
+		if err := recordBest(ctx, tx, player, g); err != nil {
+			return State{}, err
+		}
+	}
+	return s.engine.State(g), nil
+}
+
+// --- Versus ---------------------------------------------------------------
+//
+// The room store (internal/rooms) plays each player's race as a Wordle game
+// here, inside its own transaction, so a guess and the room's record of it
+// commit together or not at all.
+
+// Pick returns a random answer from m's generations, for a Versus round.
+func (s *Store) Pick(m GenMask) int { return s.engine.Pick(m) }
+
+// StartInRound makes player's Wordle game for a Versus round, with the
+// round's answer, and returns its ID.
+func (s *Store) StartInRound(ctx context.Context, tx pgx.Tx, player, roundID string, mask GenMask, answerID int) (string, error) {
+	var id string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO games (player_id, mode, gen_mask, room_round_id) VALUES ($1::uuid, 'wordle', $2, $3::uuid)
+		RETURNING id::text`, player, int16(mask), roundID).Scan(&id); err != nil {
+		return "", err
+	}
+	return id, insertRounds(ctx, tx, id, []Round{{N: 1, AnswerID: answerID}})
+}
+
+// GuessInRound plays a guess in player's game for a Versus round. n is the
+// guess's number (1 for the first), so a guess sent twice is refused
+// (ErrWrongRound) rather than played twice.
+func (s *Store) GuessInRound(ctx context.Context, tx pgx.Tx, player, gameID string, n int, name string) (Comparison, State, error) {
+	var c Comparison
+	st, err := s.moveIn(ctx, tx, player, gameID, true, func(g *Game) (*Round, error) {
+		if g.Status == Active && g.open().N != n {
+			return nil, ErrWrongRound
+		}
+		r, comparison, err := s.engine.Guess(g, name)
+		c = comparison
+		return r, err
+	})
+	return c, st, err
+}
+
+// EndRound ends the Versus round's games still going, as lost, which
+// reveals their answer.
+func (s *Store) EndRound(ctx context.Context, tx pgx.Tx, roundID string) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE games SET status = 'lost', updated_at = now()
+		WHERE room_round_id = $1::uuid AND status = 'active'`, roundID)
+	return err
 }
 
 // load reads player's game id with its rounds, locking the game's row when
@@ -161,13 +222,14 @@ func load(ctx context.Context, tx pgx.Tx, player, id string, lock bool) (*Game, 
 	if !uuidPattern.MatchString(id) {
 		return nil, ErrNotFound
 	}
-	q := `SELECT id::text, mode, gen_mask, status, score FROM games WHERE id = $1::uuid AND player_id = $2::uuid`
+	q := `SELECT id::text, mode, gen_mask, status, score, coalesce(room_round_id::text, '')
+		FROM games WHERE id = $1::uuid AND player_id = $2::uuid`
 	if lock {
 		q += ` FOR UPDATE`
 	}
 	g := &Game{}
 	var mask int16
-	err := tx.QueryRow(ctx, q, id, player).Scan(&g.ID, &g.Mode, &mask, &g.Status, &g.Score)
+	err := tx.QueryRow(ctx, q, id, player).Scan(&g.ID, &g.Mode, &mask, &g.Status, &g.Score, &g.RoomRound)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

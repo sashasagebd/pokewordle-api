@@ -66,6 +66,22 @@ var (
 	ErrFinished   = errors.New("you've already finished this round")
 )
 
+var ruleErrors = []error{
+	ErrClosed, ErrFull, ErrNotMember, ErrNotHost, ErrInRound, ErrTooFew,
+	ErrNotReady, ErrNoRound, ErrNotStarted, ErrNotPlaying, ErrFinished,
+}
+
+// IsRuleError reports whether err is the rules refusing a change: the
+// player's mistake, with a message meant for them, rather than a failure.
+func IsRuleError(err error) bool {
+	for _, e := range ruleErrors {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // A Room is a lobby and its rounds.
 type Room struct {
 	ID   string
@@ -81,6 +97,9 @@ type Room struct {
 	Round *Round
 	// LastActivity is when a member last did something.
 	LastActivity time.Time
+	// Seq counts the room's saved changes. The store bumps it; the rules
+	// don't use it. A client that has seen the latest seq is up to date.
+	Seq int
 }
 
 // A Member is a player in a room.
@@ -102,7 +121,8 @@ func (m *Member) graceEnds() time.Time { return m.DisconnectedAt.Add(Grace) }
 
 // A Round is one race.
 type Round struct {
-	N        int // 1, 2, ... within the room
+	ID       string // the store's; "" until saved
+	N        int    // 1, 2, ... within the room
 	AnswerID int
 	// StartsAt is the end of the countdown, EndsAt the latest it can end
 	// (brought forward by the first solve).
@@ -116,7 +136,11 @@ type Round struct {
 
 // A Player is a member's race in one round.
 type Player struct {
-	PlayerID    string
+	PlayerID string
+	Name     string // as a member when the round started
+	// GameID is the player's Wordle game for the round, filled in by the
+	// store.
+	GameID      string
 	Guesses     int
 	SolvedAt    time.Time
 	ForfeitedAt time.Time
@@ -337,7 +361,7 @@ func (r *Room) Start(player string, answerID int, now time.Time) error {
 	}
 	rd.EndsAt = rd.StartsAt.Add(RoundLength)
 	for i := range r.Members {
-		rd.Players = append(rd.Players, Player{PlayerID: r.Members[i].PlayerID})
+		rd.Players = append(rd.Players, Player{PlayerID: r.Members[i].PlayerID, Name: r.Members[i].Name})
 		r.Members[i].Ready = false // ready again for the one after
 	}
 	r.Round, r.Status = rd, Playing
@@ -372,6 +396,11 @@ func (r *Room) Forfeit(player string, now time.Time) error {
 	r.changed(now)
 	return nil
 }
+
+// CanMove checks that player can make a move in the round now, without
+// making one: the store asks before the guess goes to the game, so a guess
+// the room would refuse is never played.
+func (r *Room) CanMove(player string, now time.Time) error { return r.playing(player, now) }
 
 // playing checks that player can make a move in the round now.
 func (r *Room) playing(player string, now time.Time) error {

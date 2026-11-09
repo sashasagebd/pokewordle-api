@@ -18,7 +18,12 @@ const betterThanStored = `
 
 // improvesBest reports whether the move just played set a score worth
 // recording: a won Wordle, or a right streak answer.
+//
+// Versus games never count: their boards would be a different race.
 func improvesBest(g *Game, answered *Round) bool {
+	if g.RoomRound != "" {
+		return false
+	}
 	if g.Mode == Wordle {
 		return g.Status == Won
 	}

@@ -80,7 +80,7 @@ func (rd *Round) Winner() string {
 		return ""
 	}
 	ps := rd.Ranking()
-	if ps[0].Outcome == Forfeited || len(ps) > 1 && ps[1].Rank == 1 {
+	if len(ps) == 0 || ps[0].Outcome == Forfeited || len(ps) > 1 && ps[1].Rank == 1 {
 		return ""
 	}
 	return ps[0].PlayerID
