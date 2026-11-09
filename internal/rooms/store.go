@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	mrand "math/rand/v2"
 	"regexp"
@@ -31,7 +32,8 @@ var (
 const TicketTTL = 30 * time.Second
 
 // NotifyChannel is the Postgres channel every saved change is announced on,
-// as "<room id>:<seq>", so each instance can push it to its own sockets.
+// as "<room id>:<seq>:<Unix microseconds>", so each instance can push it to
+// its own sockets.
 const NotifyChannel = "room_events"
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -101,6 +103,9 @@ func (s *Store) Create(ctx context.Context, player string, mask games.GenMask) (
 		})
 		if errors.Is(err, errCodeTaken) {
 			continue
+		}
+		if err == nil {
+			slog.Info("room made", "room", room.Code)
 		}
 		return room, err
 	}
@@ -299,7 +304,9 @@ func (s *Store) change(ctx context.Context, id string, fn func(tx pgx.Tx, r *Roo
 	var room *Room
 	var saved bool
 	var fnErr error
+	var logs []func() // what to log once it's committed
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		logs = nil // a retry starts afresh
 		r, err := load(ctx, tx, id, true)
 		if err != nil {
 			return err
@@ -312,6 +319,7 @@ func (s *Store) change(ctx context.Context, id string, fn func(tx pgx.Tx, r *Roo
 		if r.Status == Playing {
 			openRound = r.Round.ID
 		}
+		wasClosed := r.Status == Closed
 		advanced := r.Advance(now)
 
 		changed := false
@@ -339,6 +347,13 @@ func (s *Store) change(ctx context.Context, id string, fn func(tx pgx.Tx, r *Roo
 			if err := s.games.EndRound(ctx, tx, openRound); err != nil {
 				return err
 			}
+			logs = append(logs, roundLog("round finished", r))
+		}
+		if r.Status == Playing && r.Round.ID != openRound {
+			logs = append(logs, roundLog("round started", r))
+		}
+		if r.Status == Closed && !wasClosed {
+			logs = append(logs, func() { slog.Info("room closed", "room", r.Code) })
 		}
 		saved = true
 		return save(ctx, tx, r)
@@ -346,7 +361,32 @@ func (s *Store) change(ctx context.Context, id string, fn func(tx pgx.Tx, r *Roo
 	if err != nil {
 		return nil, false, err
 	}
+	for _, l := range logs {
+		l()
+	}
 	return room, saved, fnErr
+}
+
+// roundLog returns a log line about r's round: who's in it and, once it's
+// over, how it went.
+func roundLog(msg string, r *Room) func() {
+	rd := r.Round
+	attrs := []any{"room", r.Code, "round", rd.N, "mode", rd.Mode, "players", len(rd.Players)}
+	if !rd.FinishedAt.IsZero() {
+		winner := ""
+		for _, p := range rd.Players {
+			if p.PlayerID == rd.Winner() {
+				winner = p.Name
+			}
+		}
+		how := "decided" // as soon as places couldn't change
+		if rd.FinishedAt.Equal(rd.EndsAt) {
+			how = "time"
+		}
+		attrs = append(attrs, "winner", winner, "ended_by", how,
+			"length_s", int(rd.FinishedAt.Sub(rd.StartsAt).Seconds()))
+	}
+	return func() { slog.Info(msg, attrs...) }
 }
 
 // clock returns the database's time right now.
@@ -516,7 +556,10 @@ func save(ctx context.Context, tx pgx.Tx, r *Room) error {
 		}
 	}
 
-	_, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, NotifyChannel, fmt.Sprintf("%s:%d", r.ID, r.Seq))
+	// The time is for the hubs' fanout numbers; a version before this one
+	// reads only the ID, so it can be added to.
+	_, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, NotifyChannel,
+		fmt.Sprintf("%s:%d:%d", r.ID, r.Seq, time.Now().UnixMicro()))
 	return err
 }
 

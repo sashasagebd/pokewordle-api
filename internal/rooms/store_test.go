@@ -377,7 +377,7 @@ func TestChangesAreAnnounced(t *testing.T) {
 		if err != nil {
 			t.Fatalf("no notification %q: %v", want, err)
 		}
-		if n.Payload == want {
+		if strings.HasPrefix(n.Payload, want+":") { // then the commit time
 			return
 		}
 	}

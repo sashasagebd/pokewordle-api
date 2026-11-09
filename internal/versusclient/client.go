@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,11 +40,40 @@ func New(base string) *Client {
 type StatusError struct {
 	Status int
 	Msg    string
+
+	retryAfter time.Duration // a 429's Retry-After
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("%d: %s", e.Status, e.Msg) }
 
+// post sends a request, waiting out the API's rate limit (429, Retry-After)
+// rather than failing: a load test from one address runs into it by design.
 func (c *Client) post(ctx context.Context, path string, body, out any) error {
+	for {
+		wait, err := c.postOnce(ctx, path, body, out)
+		if wait == 0 {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// postOnce sends a request once. A rate-limited one comes back with how long
+// to wait before trying again.
+func (c *Client) postOnce(ctx context.Context, path string, body, out any) (time.Duration, error) {
+	err := c.do(ctx, path, body, out)
+	var status *StatusError
+	if errors.As(err, &status) && status.Status == http.StatusTooManyRequests {
+		return status.retryAfter, err
+	}
+	return 0, err
+}
+
+func (c *Client) do(ctx context.Context, path string, body, out any) error {
 	var r *bytes.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -72,7 +102,12 @@ func (c *Client) post(ctx context.Context, path string, body, out any) error {
 	if res.StatusCode >= 300 {
 		var e struct{ Error string }
 		json.NewDecoder(res.Body).Decode(&e)
-		return &StatusError{res.StatusCode, e.Error}
+		se := &StatusError{Status: res.StatusCode, Msg: e.Error}
+		if res.StatusCode == http.StatusTooManyRequests {
+			secs, _ := strconv.Atoi(res.Header.Get("Retry-After"))
+			se.retryAfter = time.Duration(max(secs, 1)) * time.Second
+		}
+		return se
 	}
 	if out == nil {
 		return nil
@@ -344,4 +379,30 @@ func (s *Socket) Err() error {
 	default:
 		return nil
 	}
+}
+
+// PokemonNames lists the names of generation gen's Pokémon, from the API at
+// base, for guesses.
+func PokemonNames(ctx context.Context, base string, gen int) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/pokemon?gens=%d", strings.TrimRight(base, "/"), gen), nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, &StatusError{Status: res.StatusCode, Msg: "listing Pokémon"}
+	}
+	var ps []struct{ Name string }
+	if err := json.NewDecoder(res.Body).Decode(&ps); err != nil {
+		return nil, err
+	}
+	names := make([]string, len(ps))
+	for i, p := range ps {
+		names[i] = p.Name
+	}
+	return names, nil
 }

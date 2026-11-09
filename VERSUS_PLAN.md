@@ -17,7 +17,7 @@ Code paths are in this repo; phase 4 is in the frontend,
 - [x] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch (in `pokewordle`: `/versus`, `useRoom`)
 - [x] **5. Every mode:** Higher or Lower and Who's That in rooms too, as survival races over the same Pokémon ([below](#every-mode))
 - [ ] **6. Resilience:** a deploy, the database dropping `LISTEN`, deadlines with nobody connected and tabs on two instances, each staged in CI ([Testing](#testing)); `cmd/versuscheck` through a real deploy still to run
-- [ ] **7. Load and observability:** a bot load generator, per-room logs, latency numbers in the README
+- [ ] **7. Load and observability:** `cmd/versusload` (bots in many rooms, reply and broadcast latency), room and round logs, a `hub stats` log line with fanout times; the README's numbers still to measure
 - [ ] **Later:** a quick-match queue (it just pairs two players into a room), ping-compensated times, ratings
 
 Phases 1 to 4 make it playable, 5 makes it every game, and 6 and 7 make it
@@ -272,5 +272,10 @@ At most 5 messages a second (bursts of 10), 1 KB each; a client more than
   after round with two bots against the deployed API; deploy while it runs.
   It reports moves never answered, unexpected errors and rooms going back a
   version, and exits 1 if there were any.
-- **Load:** `cmd/bots` plays many rooms at once against a deployed API and
-  reports guess-to-broadcast latency (p50, p99), for a table in the README.
+- **Load:** [cmd/versusload](cmd/versusload/main.go) plays many rooms at
+  once with the same bots ([internal/versusbot](internal/versusbot/bot.go)),
+  and reports reply and broadcast latency (p50, p95, p99, max) as a row for
+  the README's table. The bots themselves are tested in CI
+  ([bots_test.go](internal/live/bots_test.go)): two of them, one on each of
+  two instances, play round after round and must report no problems, real
+  latencies, and hubs that timed their fanouts.
