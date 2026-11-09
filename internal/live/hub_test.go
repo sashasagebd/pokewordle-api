@@ -353,15 +353,24 @@ func TestDisconnectsShowAndShutdownSaysReconnect(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("alice's socket is still open after shutdown")
 	}
-	var disconnected int
-	if err := b.pool.QueryRow(context.Background(), `
-		SELECT count(*) FROM room_members
-		WHERE room_id = (SELECT id FROM rooms WHERE code = $1) AND disconnected_at IS NOT NULL`,
-		code).Scan(&disconnected); err != nil {
-		t.Fatal(err)
-	}
-	if disconnected != 2 {
-		t.Errorf("%d of 2 members recorded as disconnected after the shutdown", disconnected)
+	// Where it settles is what counts: a refresh under way elsewhere may
+	// still be finishing.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var disconnected int
+		if err := b.pool.QueryRow(context.Background(), `
+			SELECT count(*) FROM room_members
+			WHERE room_id = (SELECT id FROM rooms WHERE code = $1) AND disconnected_at IS NOT NULL`,
+			code).Scan(&disconnected); err != nil {
+			t.Fatal(err)
+		}
+		if disconnected == 2 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of 2 members recorded as disconnected 5s after the shutdown", disconnected)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

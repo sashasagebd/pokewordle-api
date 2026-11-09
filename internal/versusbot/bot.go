@@ -175,14 +175,19 @@ type Bot struct {
 	// Think and twice it. 1s if 0.
 	Think time.Duration
 
-	seq     int
-	asked   int // the room version it last asked for something in (ready, start, settings)
-	round   int
-	sent    int // the move number it last sent
-	sentAt  time.Time
-	pending bool // a move sent, not yet answered
-	guessed map[string]bool
-	timer   *time.Timer
+	seq   int
+	asked int // the room version it last asked for something in (ready, start, settings)
+	// The round it last asked to start after (0: before the first), and
+	// when: the lobby may change again before the round begins (someone's
+	// connection recorded), and that's no reason to ask twice.
+	startAfter int
+	startedAt  time.Time
+	round      int
+	sent       int // the move number it last sent
+	sentAt     time.Time
+	pending    bool // a move sent, not yet answered
+	guessed    map[string]bool
+	timer      *time.Timer
 	// later runs what a timer set up, in Play's goroutine: only Play touches
 	// the bot's state.
 	later chan func()
@@ -212,7 +217,7 @@ func (b *Bot) Play(ctx context.Context) {
 			f()
 		case <-nudge.C:
 			if v, seq := b.S.Room(); seq > 0 {
-				b.act(ctx, v, time.Now())
+				b.act(ctx, v, seq, time.Now())
 			}
 		case m, open := <-b.S.Messages():
 			if !open {
@@ -245,23 +250,23 @@ func (b *Bot) handle(ctx context.Context, m versusclient.Message) {
 		}
 		b.seq = m.Seq
 		b.Room.seen(m.Room, now, &b.Stats.Broadcast)
-		b.act(ctx, m.Room, m.ServerNow)
+		b.act(ctx, m.Room, m.Seq, m.ServerNow)
 	case "guess", "answer":
 		if m.N == b.sent && b.pending {
 			b.pending = false
 			b.Stats.Answered.Add(1)
 			b.Stats.Reply.Add(now.Sub(b.sentAt))
 		}
-		v, _ := b.S.Room()
-		b.act(ctx, v, now)
+		v, seq := b.S.Room()
+		b.act(ctx, v, seq, now)
 	case "error":
 		for _, ok := range expected {
 			if strings.Contains(strings.ToLower(m.Error), ok) {
 				if m.N == b.sent {
 					b.pending = false
 				}
-				v, _ := b.S.Room()
-				b.act(ctx, v, now)
+				v, seq := b.S.Room()
+				b.act(ctx, v, seq, now)
 				return
 			}
 		}
@@ -270,20 +275,22 @@ func (b *Bot) handle(ctx context.Context, m versusclient.Message) {
 }
 
 // act does what the room calls for: settings, readying, starting, a move.
-func (b *Bot) act(ctx context.Context, v live.View, serverNow time.Time) {
+// seq is v's version: the socket's newest room can be ahead of the last
+// message handled, so what was asked is kept by the version it was asked in.
+func (b *Bot) act(ctx context.Context, v live.View, seq int, serverNow time.Time) {
 	if b.timer != nil {
 		b.timer.Stop()
 	}
 	switch {
 	case v.Status == rooms.Lobby:
-		b.lobby(ctx, v)
+		b.lobby(ctx, v, seq)
 	case v.Status == rooms.Playing && v.Round != nil:
 		b.race(ctx, v, serverNow)
 	}
 }
 
-func (b *Bot) lobby(ctx context.Context, v live.View) {
-	if b.asked == b.seq {
+func (b *Bot) lobby(ctx context.Context, v live.View, seq int) {
+	if seq <= b.asked {
 		return // already asked in this version; wait for the next
 	}
 	var me live.MemberView
@@ -297,13 +304,20 @@ func (b *Bot) lobby(ctx context.Context, v live.View) {
 	}
 	switch {
 	case b.Host && string(v.Mode) != b.Mode:
-		b.asked = b.seq
+		b.asked = seq
 		b.send(ctx, map[string]any{"type": "settings", "mode": b.Mode, "gens": []int{1}})
 	case b.Host && allReady:
-		b.asked = b.seq
+		last := 0
+		if v.Round != nil {
+			last = v.Round.N
+		}
+		if last == b.startAfter && !b.startedAt.IsZero() && time.Since(b.startedAt) < 5*time.Second {
+			return // asked already; the round is on its way
+		}
+		b.asked, b.startAfter, b.startedAt = seq, last, time.Now()
 		b.send(ctx, map[string]any{"type": "start"})
 	case !b.Host && !me.Ready && string(v.Mode) == b.Mode:
-		b.asked = b.seq
+		b.asked = seq
 		b.send(ctx, map[string]any{"type": "ready", "ready": true})
 	}
 }

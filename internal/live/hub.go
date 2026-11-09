@@ -434,7 +434,10 @@ func (h *Hub) refresh(rc *roomConns, committed time.Time) error {
 		}
 		// Connected here but recorded as disconnected: their socket on
 		// another instance closed (a deploy). Put it right.
-		if !m.DisconnectedAt.IsZero() && !healed[s.player] && room.Status != rooms.Closed {
+		// Only if they still are connected here: the sockets were listed
+		// before the room was loaded, and one closing in between (its
+		// disconnect is what this refresh is about) isn't to be put right.
+		if !m.DisconnectedAt.IsZero() && !healed[s.player] && room.Status != rooms.Closed && h.playerHere(s.roomID, s.player) {
 			healed[s.player] = true
 			if _, err := h.rooms.Connect(h.ctx, s.player, room.ID); err != nil {
 				s.closeFor(err)

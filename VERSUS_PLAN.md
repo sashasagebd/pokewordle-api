@@ -16,8 +16,8 @@ Code paths are in this repo; phase 4 is in the frontend,
 - [x] **3. Sockets:** `/rooms` endpoints, `/ws`, a hub per instance (`internal/live`), `LISTEN`/`NOTIFY` between instances, closing with 1012 on shutdown
 - [x] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch (in `pokewordle`: `/versus`, `useRoom`)
 - [x] **5. Every mode:** Higher or Lower and Who's That in rooms too, as survival races over the same Pokémon ([below](#every-mode))
-- [ ] **6. Resilience:** a deploy, the database dropping `LISTEN`, deadlines with nobody connected and tabs on two instances, each staged in CI ([Testing](#testing)); `cmd/versuscheck` through a real deploy still to run
-- [ ] **7. Load and observability:** `cmd/versusload` (bots in many rooms, reply and broadcast latency), room and round logs, a `hub stats` log line with fanout times; the README's numbers still to measure
+- [x] **6. Resilience:** a deploy, the database dropping `LISTEN`, deadlines with nobody connected and tabs on two instances, each staged in CI ([Testing](#testing)), and a real deploy survived (2026-11-08: 159 moves across it, every one answered)
+- [x] **7. Load and observability:** `cmd/versusload` (bots in many rooms, reply and broadcast latency), room and round logs, a `hub stats` log line with fanout times; measured on the live API (README: broadcast p50 57 ms, p99 80 ms at 20 rooms)
 - [x] **8. Quick match:** a queue per mode and set of generations, pairing the longest-waiting into a room that starts by itself ([below](#quick-match))
 - [ ] **Later:** ping-compensated times, ratings
 
@@ -300,7 +300,10 @@ At most 5 messages a second (bursts of 10), 1 KB each; a client more than
 - **A real deploy:** [cmd/versuscheck](cmd/versuscheck/main.go) plays round
   after round with two bots against the deployed API; deploy while it runs.
   It reports moves never answered, unexpected errors and rooms going back a
-  version, and exits 1 if there were any.
+  version, and exits 1 if there were any. On 2026-11-08, through a redeploy
+  of the live API: 53 rounds and 159 moves over 8 minutes, both bots
+  reconnecting at the switch, every move answered, nothing lost or played
+  twice.
 - **Load:** [cmd/versusload](cmd/versusload/main.go) plays many rooms at
   once with the same bots ([internal/versusbot](internal/versusbot/bot.go)),
   and reports reply and broadcast latency (p50, p95, p99, max) as a row for
