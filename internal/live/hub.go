@@ -25,6 +25,9 @@ const (
 	CloseNotMember websocket.StatusCode = 4001
 )
 
+// ListenerName is the application_name of each hub's LISTEN connection.
+const ListenerName = "pokewordle-api hub"
+
 // sweepEvery is how often the hub looks for rooms with a deadline passed
 // that no timer covers (nobody connected here).
 const sweepEvery = time.Second
@@ -111,6 +114,10 @@ func (h *Hub) listenOnce() error {
 	// to the pool.
 	conn := c.Hijack()
 	defer conn.Close(context.WithoutCancel(h.ctx))
+	// Named, to be told apart from the pool's connections (pg_stat_activity).
+	if _, err := conn.Exec(h.ctx, "SET application_name = '"+ListenerName+"'"); err != nil {
+		return err
+	}
 	if _, err := conn.Exec(h.ctx, "LISTEN "+rooms.NotifyChannel); err != nil {
 		return err
 	}
