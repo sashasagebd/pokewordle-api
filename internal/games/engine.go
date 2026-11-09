@@ -72,6 +72,11 @@ type Game struct {
 	// for a solo game. A room game is only played through its room, and
 	// never counts toward best scores.
 	RoomRound string
+	// Seed, when not 0, is what the game's Pokémon are drawn from: round k's
+	// from the seed and k alone (and the one before it, never repeated). So
+	// in a Versus round, every player meets the same Pokémon in the same
+	// order, however fast each goes.
+	Seed int64
 }
 
 // A Round is one thing to answer.
@@ -137,25 +142,35 @@ func (e *Engine) intn(n int) int {
 }
 
 // New sets up a game (without an ID: the store gives it one).
-func (e *Engine) New(mode Mode, mask GenMask) *Game {
-	g := &Game{Mode: mode, Mask: mask, Status: Active}
+func (e *Engine) New(mode Mode, mask GenMask) *Game { return e.NewSeeded(mode, mask, 0) }
+
+// NewSeeded sets up a game whose Pokémon are drawn from seed (see
+// Game.Seed); 0 means at random, as New.
+func (e *Engine) NewSeeded(mode Mode, mask GenMask, seed int64) *Game {
+	g := &Game{Mode: mode, Mask: mask, Status: Active, Seed: seed}
 	switch mode {
 	case Wordle:
-		g.Rounds = []Round{{N: 1, AnswerID: e.Dex.random(mask, e.intn)}}
+		g.Rounds = []Round{{N: 1, AnswerID: e.draw(g, 1)}}
 	case HigherLower:
-		current := e.Dex.random(mask, e.intn)
-		g.Rounds = []Round{{N: 1, OtherID: current, AnswerID: e.Dex.random(mask, e.intn, current)}}
+		current := e.draw(g, 0)
+		g.Rounds = []Round{{N: 1, OtherID: current, AnswerID: e.draw(g, 1, current)}}
 		e.addRound(g)
 	case WhosThat:
-		g.Rounds = []Round{{N: 1, AnswerID: e.Dex.random(mask, e.intn)}}
+		g.Rounds = []Round{{N: 1, AnswerID: e.draw(g, 1)}}
 		e.addRound(g)
 	}
 	return g
 }
 
-// Pick returns a random Pokémon from m's generations: a Versus round's
-// answer, the same for everyone in it.
-func (e *Engine) Pick(m GenMask) int { return e.Dex.random(m, e.intn) }
+// draw picks the Pokémon for round k of g (other than the excluded ones):
+// from g's seed and k when it has one, otherwise at random.
+func (e *Engine) draw(g *Game, k int, exclude ...int) int {
+	intn := e.intn
+	if g.Seed != 0 {
+		intn = rand.New(rand.NewPCG(uint64(g.Seed), uint64(k))).IntN
+	}
+	return e.Dex.random(g.Mask, intn, exclude...)
+}
 
 // addRound adds the next streak round. It never repeats the Pokémon just
 // before it.
@@ -165,7 +180,7 @@ func (e *Engine) addRound(g *Game) {
 	if g.Mode == HigherLower {
 		r.OtherID = last.AnswerID // the hidden Pokémon becomes the shown one
 	}
-	r.AnswerID = e.Dex.random(g.Mask, e.intn, last.AnswerID)
+	r.AnswerID = e.draw(g, r.N, last.AnswerID)
 	g.Rounds = append(g.Rounds, r)
 }
 

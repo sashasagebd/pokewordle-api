@@ -64,11 +64,12 @@ var (
 	ErrNotStarted = errors.New("the round hasn't started yet")
 	ErrNotPlaying = errors.New("you're not playing this round; you're in the next one")
 	ErrFinished   = errors.New("you've already finished this round")
+	ErrWrongMove  = errors.New("this round isn't played that way")
 )
 
 var ruleErrors = []error{
 	ErrClosed, ErrFull, ErrNotMember, ErrNotHost, ErrInRound, ErrTooFew,
-	ErrNotReady, ErrNoRound, ErrNotStarted, ErrNotPlaying, ErrFinished,
+	ErrNotReady, ErrNoRound, ErrNotStarted, ErrNotPlaying, ErrFinished, ErrWrongMove,
 }
 
 // IsRuleError reports whether err is the rules refusing a change: the
@@ -88,7 +89,9 @@ type Room struct {
 	Code string
 	// Host is the member who picks the settings and starts rounds: whoever
 	// made the room, then the longest-present member. "" once it's empty.
-	Host    string
+	Host string
+	// Mode is the game the next round plays, Mask its generations.
+	Mode    games.Mode
 	Mask    games.GenMask
 	Status  Status
 	Members []Member // in the order they joined
@@ -120,10 +123,20 @@ func (m *Member) connected() bool { return m.DisconnectedAt.IsZero() }
 func (m *Member) graceEnds() time.Time { return m.DisconnectedAt.Add(Grace) }
 
 // A Round is one race.
+//
+// In Wordle everyone looks for the same Pokémon, and the first to find it
+// wins. The streak modes (Higher or Lower, Who's That) are survival races:
+// everyone meets the same Pokémon in the same order, one wrong answer ends a
+// run, and the longest streak wins, ties going to whoever got there first.
 type Round struct {
-	ID       string // the store's; "" until saved
-	N        int    // 1, 2, ... within the room
+	ID   string // the store's; "" until saved
+	N    int    // 1, 2, ... within the room
+	Mode games.Mode
+	// AnswerID is Wordle's answer; in the streak modes, the first Pokémon.
 	AnswerID int
+	// Seed is what every player's Pokémon are drawn from, so they meet the
+	// same ones (the store's: the rules don't use it).
+	Seed int64
 	// StartsAt is the end of the countdown, EndsAt the latest it can end
 	// (brought forward by the first solve).
 	StartsAt, EndsAt time.Time
@@ -138,28 +151,38 @@ type Round struct {
 type Player struct {
 	PlayerID string
 	Name     string // as a member when the round started
-	// GameID is the player's Wordle game for the round, filled in by the
-	// store.
-	GameID      string
-	Guesses     int
-	SolvedAt    time.Time
+	// GameID is the player's game for the round, filled in by the store.
+	GameID string
+	// Wordle: their guesses so far, and when they solved it.
+	Guesses  int
+	SolvedAt time.Time
+	// Streak modes: their streak, when they reached it, and when a wrong
+	// answer ended their run.
+	Score    int
+	ScoredAt time.Time
+	OutAt    time.Time
+	// ForfeitedAt is when they gave up, or their grace ran out. In a streak
+	// mode, that ends the run keeping the streak.
 	ForfeitedAt time.Time
 }
 
-// Done reports whether the player has finished: solved it or forfeited.
-func (p *Player) Done() bool { return !p.SolvedAt.IsZero() || !p.ForfeitedAt.IsZero() }
+// Done reports whether the player has finished: solved it, been knocked out
+// or forfeited.
+func (p *Player) Done() bool { return !p.doneAt().IsZero() }
 
 func (p *Player) doneAt() time.Time {
-	if !p.SolvedAt.IsZero() {
-		return p.SolvedAt
+	for _, t := range []time.Time{p.SolvedAt, p.OutAt, p.ForfeitedAt} {
+		if !t.IsZero() {
+			return t
+		}
 	}
-	return p.ForfeitedAt
+	return time.Time{}
 }
 
 // New makes a room with host in it.
 func New(id, code, host, name string, mask games.GenMask, now time.Time) *Room {
 	return &Room{
-		ID: id, Code: code, Host: host, Mask: mask, Status: Lobby,
+		ID: id, Code: code, Host: host, Mode: games.Wordle, Mask: mask, Status: Lobby,
 		Members:      []Member{{PlayerID: host, Name: name, JoinedAt: now, DisconnectedAt: now}},
 		LastActivity: now,
 	}
@@ -310,10 +333,16 @@ func (r *Room) SetReady(player string, ready bool, now time.Time) error {
 	return nil
 }
 
-// SetGens changes the generations the next round is played in. Only the host
-// can, in the lobby, and it unreadies everyone: nobody starts a round they
-// didn't agree to.
+// SetGens changes the generations the next round is played in: SetSettings
+// keeping the mode.
 func (r *Room) SetGens(player string, mask games.GenMask, now time.Time) error {
+	return r.SetSettings(player, "", mask, now)
+}
+
+// SetSettings changes the mode ("" keeps it) and generations the next round
+// is played in. Only the host can, in the lobby, and a change unreadies
+// everyone: nobody starts a round they didn't agree to.
+func (r *Room) SetSettings(player string, mode games.Mode, mask games.GenMask, now time.Time) error {
 	if _, err := r.openAs(player, now); err != nil {
 		return err
 	}
@@ -323,8 +352,11 @@ func (r *Room) SetGens(player string, mask games.GenMask, now time.Time) error {
 	if r.Status != Lobby {
 		return ErrInRound
 	}
-	if mask != r.Mask {
-		r.Mask = mask
+	if mode == "" {
+		mode = r.Mode
+	}
+	if mode != r.Mode || mask != r.Mask {
+		r.Mode, r.Mask = mode, mask
 		for i := range r.Members {
 			r.Members[i].Ready = false
 		}
@@ -334,8 +366,9 @@ func (r *Room) SetGens(player string, mask games.GenMask, now time.Time) error {
 }
 
 // Start begins a round with every member in it, once everyone but the host
-// (whose starting it says they're ready) is ready. answerID is the Pokémon to
-// find, picked by the caller from the room's generations.
+// (whose starting it says they're ready) is ready, in the room's mode.
+// answerID is the Pokémon to find (in a streak mode, the first one), picked
+// by the caller from the room's generations.
 func (r *Room) Start(player string, answerID int, now time.Time) error {
 	if _, err := r.openAs(player, now); err != nil {
 		return err
@@ -355,7 +388,7 @@ func (r *Room) Start(player string, answerID int, now time.Time) error {
 			return ErrNotReady
 		}
 	}
-	rd := &Round{N: 1, AnswerID: answerID, StartsAt: now.Add(Countdown)}
+	rd := &Round{N: 1, Mode: r.Mode, AnswerID: answerID, StartsAt: now.Add(Countdown)}
 	if r.Round != nil {
 		rd.N = r.Round.N + 1
 	}
@@ -369,10 +402,11 @@ func (r *Room) Start(player string, answerID int, now time.Time) error {
 	return nil
 }
 
-// Guess records that player made a guess in the round, which solved it or
-// not. The first solve brings the round's end forward to FinishWindow later.
+// Guess records that player made a guess in a Wordle round, which solved it
+// or not. The first solve brings the round's end forward to FinishWindow
+// later.
 func (r *Room) Guess(player string, solved bool, now time.Time) error {
-	if err := r.playing(player, now); err != nil {
+	if err := r.CanMove(player, games.Wordle, now); err != nil {
 		return err
 	}
 	p := r.player(player)
@@ -382,6 +416,23 @@ func (r *Room) Guess(player string, solved bool, now time.Time) error {
 			r.Round.EndsAt = minTime(r.Round.EndsAt, now.Add(FinishWindow))
 		}
 		p.SolvedAt = now
+	}
+	r.changed(now)
+	return nil
+}
+
+// Answer records player's answer in a streak round: a right one adds to
+// their streak, a wrong one ends their run.
+func (r *Room) Answer(player string, correct bool, now time.Time) error {
+	if err := r.CanMove(player, games.HigherLower, now); err != nil {
+		return err
+	}
+	p := r.player(player)
+	if correct {
+		p.Score++
+		p.ScoredAt = now
+	} else {
+		p.OutAt = now
 	}
 	r.changed(now)
 	return nil
@@ -397,10 +448,19 @@ func (r *Room) Forfeit(player string, now time.Time) error {
 	return nil
 }
 
-// CanMove checks that player can make a move in the round now, without
-// making one: the store asks before the guess goes to the game, so a guess
-// the room would refuse is never played.
-func (r *Room) CanMove(player string, now time.Time) error { return r.playing(player, now) }
+// CanMove checks that player can make a move of mode's kind in the round
+// now, without making one: the store asks before the move goes to the game,
+// so a move the room would refuse is never played. A Wordle round takes
+// guesses (Guess), the streak modes answers (Answer).
+func (r *Room) CanMove(player string, mode games.Mode, now time.Time) error {
+	if err := r.playing(player, now); err != nil {
+		return err
+	}
+	if (r.Round.Mode == games.Wordle) != (mode == games.Wordle) {
+		return ErrWrongMove
+	}
+	return nil
+}
 
 // playing checks that player can make a move in the round now.
 func (r *Room) playing(player string, now time.Time) error {
@@ -432,9 +492,8 @@ func (rd *Round) solved() bool {
 //
 //   - A player still racing who has been disconnected for Grace forfeits, as
 //     of when their grace ran out (unless the round ended first).
-//   - A round ends at EndsAt, or as soon as at most one player is still
-//     racing: their place can't change any more. The room goes back to its
-//     lobby.
+//   - A round ends at EndsAt, or as soon as places can't change any more
+//     (see end). The room goes back to its lobby.
 //   - In the lobby, a member disconnected for Grace is removed.
 //   - A lobby that's empty, or idle for IdleTimeout, closes.
 func (r *Room) Advance(now time.Time) bool {
@@ -477,25 +536,59 @@ func (r *Room) Advance(now time.Time) bool {
 	return changed
 }
 
-// end reports whether the round is over by now, and when it ended.
+// end reports whether the round is over by now, and when it ended: at
+// EndsAt, or as soon as places can't change any more.
+//
+//   - Wordle: when at most one player is still racing.
+//   - Streak modes: when nobody is, or the only one who is has a longer
+//     streak than everyone else (they've won). One still going but behind
+//     plays on, to catch up or not.
 func (rd *Round) end(now time.Time) (time.Time, bool) {
 	racing := 0
+	var runner *Player
 	var last time.Time // the last player to finish
 	for i := range rd.Players {
 		p := &rd.Players[i]
 		if !p.Done() {
 			racing++
+			runner = p
 		} else if p.doneAt().After(last) {
 			last = p.doneAt()
 		}
 	}
-	if racing <= 1 && !last.IsZero() {
-		return last, true
+	if rd.Mode == games.Wordle {
+		if racing <= 1 && !last.IsZero() {
+			return last, true
+		}
+	} else {
+		if racing == 0 && !last.IsZero() {
+			return last, true
+		}
+		if racing == 1 && rd.leads(runner) {
+			at := last
+			if runner.ScoredAt.After(at) {
+				at = runner.ScoredAt
+			}
+			if at.IsZero() { // nobody else is left in the round at all
+				at = now
+			}
+			return at, true
+		}
 	}
 	if !now.Before(rd.EndsAt) {
 		return rd.EndsAt, true
 	}
 	return time.Time{}, false
+}
+
+// leads reports whether p's streak is longer than everyone else's.
+func (rd *Round) leads(p *Player) bool {
+	for i := range rd.Players {
+		if o := &rd.Players[i]; o != p && o.Score >= p.Score {
+			return false
+		}
+	}
+	return true
 }
 
 // Deadline returns when Advance next has something to do, for a timer to

@@ -175,19 +175,22 @@ func (s *Store) moveIn(ctx context.Context, tx pgx.Tx, player, id string, room b
 // here, inside its own transaction, so a guess and the room's record of it
 // commit together or not at all.
 
-// Pick returns a random answer from m's generations, for a Versus round.
-func (s *Store) Pick(m GenMask) int { return s.engine.Pick(m) }
+// FirstAnswer returns the first round's answer of a game drawn from seed:
+// a Versus round's Wordle answer, or its first Pokémon in the streak modes.
+func (s *Store) FirstAnswer(mode Mode, mask GenMask, seed int64) int {
+	return s.engine.NewSeeded(mode, mask, seed).Rounds[0].AnswerID
+}
 
-// StartInRound makes player's Wordle game for a Versus round, with the
-// round's answer, and returns its ID.
-func (s *Store) StartInRound(ctx context.Context, tx pgx.Tx, player, roundID string, mask GenMask, answerID int) (string, error) {
-	var id string
+// StartInRound makes player's game for a Versus round, its Pokémon drawn
+// from the round's seed, and returns its ID.
+func (s *Store) StartInRound(ctx context.Context, tx pgx.Tx, player, roundID string, mode Mode, mask GenMask, seed int64) (string, error) {
+	g := s.engine.NewSeeded(mode, mask, seed)
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO games (player_id, mode, gen_mask, room_round_id) VALUES ($1::uuid, 'wordle', $2, $3::uuid)
-		RETURNING id::text`, player, int16(mask), roundID).Scan(&id); err != nil {
+		INSERT INTO games (player_id, mode, gen_mask, room_round_id, seed) VALUES ($1::uuid, $2, $3, $4::uuid, $5)
+		RETURNING id::text`, player, mode, int16(mask), roundID, seed).Scan(&g.ID); err != nil {
 		return "", err
 	}
-	return id, insertRounds(ctx, tx, id, []Round{{N: 1, AnswerID: answerID}})
+	return g.ID, insertRounds(ctx, tx, g.ID, g.Rounds)
 }
 
 // GuessInRound plays a guess in player's game for a Versus round. n is the
@@ -206,6 +209,19 @@ func (s *Store) GuessInRound(ctx context.Context, tx pgx.Tx, player, gameID stri
 	return c, st, err
 }
 
+// AnswerInRound plays an answer in player's game for a streak-mode Versus
+// round. Its round number makes a resend harmless (ErrWrongRound), as in
+// solo.
+func (s *Store) AnswerInRound(ctx context.Context, tx pgx.Tx, player, gameID string, a Answer) (AnswerResult, State, error) {
+	var res AnswerResult
+	st, err := s.moveIn(ctx, tx, player, gameID, true, func(g *Game) (*Round, error) {
+		r, result, err := s.engine.Answer(g, a)
+		res = result
+		return r, err
+	})
+	return res, st, err
+}
+
 // EndRound ends the Versus round's games still going, as lost, which
 // reveals their answer.
 func (s *Store) EndRound(ctx context.Context, tx pgx.Tx, roundID string) error {
@@ -222,14 +238,14 @@ func load(ctx context.Context, tx pgx.Tx, player, id string, lock bool) (*Game, 
 	if !uuidPattern.MatchString(id) {
 		return nil, ErrNotFound
 	}
-	q := `SELECT id::text, mode, gen_mask, status, score, coalesce(room_round_id::text, '')
+	q := `SELECT id::text, mode, gen_mask, status, score, coalesce(room_round_id::text, ''), coalesce(seed, 0)
 		FROM games WHERE id = $1::uuid AND player_id = $2::uuid`
 	if lock {
 		q += ` FOR UPDATE`
 	}
 	g := &Game{}
 	var mask int16
-	err := tx.QueryRow(ctx, q, id, player).Scan(&g.ID, &g.Mode, &mask, &g.Status, &g.Score, &g.RoomRound)
+	err := tx.QueryRow(ctx, q, id, player).Scan(&g.ID, &g.Mode, &mask, &g.Status, &g.Score, &g.RoomRound, &g.Seed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

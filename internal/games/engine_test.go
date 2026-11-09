@@ -285,3 +285,63 @@ func TestStreakGiveUpRevealsTheOpenRound(t *testing.T) {
 		t.Fatalf("given-up state = %+v", s)
 	}
 }
+
+// right answers g's open streak round correctly, as only a test can.
+func right(e *Engine, g *Game) Answer {
+	r := g.open()
+	a := e.Dex.Get(r.AnswerID)
+	if g.Mode == WhosThat {
+		return Answer{N: r.N, Name: a.Name}
+	}
+	dir := Lower
+	if a.Height >= e.Dex.Get(r.OtherID).Height {
+		dir = Higher
+	}
+	return Answer{N: r.N, Dir: dir, Stat: Height}
+}
+
+// sequence plays n right answers in g and returns every Pokémon it met.
+func sequence(t *testing.T, e *Engine, g *Game, n int) []int {
+	t.Helper()
+	for range n {
+		if _, _, err := e.Answer(g, right(e, g)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ids []int
+	for _, r := range g.Rounds {
+		ids = append(ids, r.OtherID, r.AnswerID)
+	}
+	return ids
+}
+
+func TestSeededGamesMeetTheSamePokemon(t *testing.T) {
+	m := mask(t, 1)
+	for _, mode := range []Mode{HigherLower, WhosThat} {
+		// Two players: different engines (other random numbers going on),
+		// the same seed.
+		a := newEngine(t).NewSeeded(mode, m, 42)
+		other := newEngine(t)
+		other.Intn = rand.New(rand.NewPCG(7, 7)).IntN
+		b := other.NewSeeded(mode, m, 42)
+
+		// One gets ahead; the other catches up later.
+		ahead := sequence(t, newEngine(t), a, 12)
+		sequence(t, other, b, 5)
+		behind := sequence(t, other, b, 7)
+		if !slices.Equal(ahead, behind) {
+			t.Errorf("%s: the same seed met %v and %v", mode, ahead, behind)
+		}
+		for i := 1; i < len(a.Rounds); i++ {
+			if a.Rounds[i].AnswerID == a.Rounds[i-1].AnswerID {
+				t.Errorf("%s: round %d repeats the Pokémon before it", mode, i+1)
+			}
+		}
+		if c := newEngine(t).NewSeeded(mode, m, 43); c.Rounds[0].AnswerID == a.Rounds[0].AnswerID && c.Rounds[1].AnswerID == a.Rounds[1].AnswerID {
+			t.Errorf("%s: seeds 42 and 43 start the same", mode)
+		}
+	}
+	if w1, w2 := newEngine(t).NewSeeded(Wordle, m, 9), newEngine(t).NewSeeded(Wordle, m, 9); w1.Rounds[0].AnswerID != w2.Rounds[0].AnswerID {
+		t.Error("seeded Wordles have different answers")
+	}
+}
