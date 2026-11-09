@@ -46,6 +46,7 @@ CREATE TABLE room_round_players (
     round_id     uuid NOT NULL REFERENCES room_rounds ON DELETE CASCADE,
     player_id    uuid NOT NULL REFERENCES players ON DELETE CASCADE,
     position     smallint NOT NULL,  -- the order they joined the room in
+    name         text NOT NULL,      -- as in the room then: results outlast leaving
     game_id      uuid NOT NULL REFERENCES games ON DELETE CASCADE,
     guesses      integer NOT NULL DEFAULT 0 CHECK (guesses >= 0),
     solved_at    timestamptz,

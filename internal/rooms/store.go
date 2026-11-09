@@ -207,8 +207,8 @@ func (s *Store) Start(ctx context.Context, player, id string) (*Room, error) {
 			}
 			p.GameID = gameID
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO room_round_players (round_id, player_id, position, game_id)
-				VALUES ($1::uuid, $2::uuid, $3, $4::uuid)`, rd.ID, p.PlayerID, i, gameID); err != nil {
+				INSERT INTO room_round_players (round_id, player_id, position, name, game_id)
+				VALUES ($1::uuid, $2::uuid, $3, $4, $5::uuid)`, rd.ID, p.PlayerID, i, p.Name, gameID); err != nil {
 				return false, err
 			}
 		}
@@ -411,7 +411,7 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 	}
 	rd.FinishedAt = orZero(finished)
 	rows, err = tx.Query(ctx, `
-		SELECT player_id::text, game_id::text, guesses, solved_at, forfeited_at FROM room_round_players
+		SELECT player_id::text, name, game_id::text, guesses, solved_at, forfeited_at FROM room_round_players
 		WHERE round_id = $1::uuid ORDER BY position`, rd.ID)
 	if err != nil {
 		return nil, err
@@ -419,7 +419,7 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 	for rows.Next() {
 		var p Player
 		var solved, forfeited *time.Time
-		if err := rows.Scan(&p.PlayerID, &p.GameID, &p.Guesses, &solved, &forfeited); err != nil {
+		if err := rows.Scan(&p.PlayerID, &p.Name, &p.GameID, &p.Guesses, &solved, &forfeited); err != nil {
 			return nil, err
 		}
 		p.SolvedAt, p.ForfeitedAt = orZero(solved), orZero(forfeited)

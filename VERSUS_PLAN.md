@@ -13,9 +13,9 @@ Code paths are in this repo; phase 4 is in the frontend,
 
 - [x] **1. Rules:** `internal/rooms`, the pure rules of a room (no database, no clock), with tests
 - [x] **2. Store:** migration, `rooms.Store`, socket tickets, solo games ignoring room games, cleanup
-- [ ] **3. Sockets:** `/ws`, a hub per instance, `LISTEN`/`NOTIFY` between instances
+- [x] **3. Sockets:** `/rooms` endpoints, `/ws`, a hub per instance (`internal/live`), `LISTEN`/`NOTIFY` between instances, closing with 1012 on shutdown
 - [ ] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch
-- [ ] **5. Resilience:** resume with a snapshot, grace and forfeit, closing sockets on shutdown, room expiry
+- [ ] **5. Resilience:** prove it end to end: an instance stopped mid-round, its clients carrying on through the other; then a real deploy. (Grace, forfeits, expiry, 1012 on shutdown and reconnecting for the latest room are built.)
 - [ ] **6. Load and observability:** a bot load generator, per-room logs, latency numbers in the README
 - [ ] **Later:** a quick-match queue (it just pairs two players into a room), ping-compensated times, ratings
 
@@ -140,36 +140,47 @@ player's race: their game, guesses, when they solved it or forfeited) and
 | Request | What |
 |---|---|
 | `POST /rooms` `{gens}` | Makes a room with you as host: `{code}` (201). |
-| `POST /rooms/{code}/join` | Joins (again, harmlessly, if you're in). 404 for an unknown or closed room, 409 if it's full. |
-| `POST /rooms/{code}/ticket` | `{ticket}` for the socket. |
-| `GET /ws?ticket=` | The socket. |
+| `POST /rooms/{code}/join` | Joins (again, harmlessly, if you're in): `{code}`. 404 for an unknown or closed room, 409 if it's full. |
+| `POST /rooms/{code}/ticket` | `{ticket}` (201) for the socket, good for 30 seconds, once. 403 if you're not in the room. |
+| `GET /ws?ticket=` | The socket. 401 for a bad ticket, 403 from an origin not in `ALLOWED_ORIGINS` (no `Origin`, not a browser, is fine). |
 
 Joining and making rooms share the 2-a-second `POST` bucket, which makes
 guessing codes hopeless.
 
-Messages are JSON. Every one from the server carries the room's `seq`.
+### The socket
+
+Messages are JSON objects with a `type`. There's no resuming: a socket
+opening gets the room as it is, and every change after sends the whole room
+again (a room is small). A client keeps the one with the highest `seq`.
 
 | Client → server | |
 |---|---|
-| `resume {code, lastSeq}` | First message; answered with a `snapshot` |
-| `ready {ready}` | Lobby |
-| `settings {gens}` | Host, lobby |
-| `start` | Host, everyone else ready |
-| `guess {n, name}` | `n` as in solo Wordle, so a resend is harmless |
-| `forfeit`, `leave` | |
+| `{"type": "ready", "ready": true}` | Lobby |
+| `{"type": "settings", "gens": [1, 2]}` | Host, lobby; unreadies everyone |
+| `{"type": "start"}` | Host, everyone else ready |
+| `{"type": "guess", "n": 1, "name": "pikachu"}` | `n` counts your guesses from 1, so a resend is refused, not played twice |
+| `{"type": "forfeit"}`, `{"type": "leave"}` | |
 
 | Server → client | |
 |---|---|
-| `snapshot` | The whole room as you may see it, `serverNow` included |
-| `lobby {members, host, gens}` | |
-| `countdown {startsAt, endsAt, serverNow}` | A round is starting |
-| `guessResult {n, comparison}` | To the guesser only |
-| `progress {playerId, tiles}` | Someone's guess, without the Pokémon |
-| `presence {playerId, connected, graceEndsAt}` | |
-| `finished {ranking, winner, answer, guesses}` | |
-| `error {msg}` | A move that couldn't be played, for the player |
+| `{"type": "room", "seq", "serverNow", "room"}` | On opening and every change: the room as you may see it (below) |
+| `{"type": "guess", "n", "result", "game"}` | Your guess's comparison and your game, as solo Wordle answers |
+| `{"type": "error", "for", "n", "error"}` | A message that couldn't be acted on; `error` is meant for the player |
 
-At most 5 messages a second per socket, on top of the HTTP limits.
+The room: `code`, `status` (`lobby`, `playing`, `closed`), `gens`, `you`
+and `host` (public IDs: stable in the room, never a player ID), `members`
+(`id`, `name`, `ready`, `connected`, `graceEndsAt`), and `round`, the one
+being played or the last: `n`, `startsAt` (the end of the countdown),
+`endsAt`, `finishedAt`, `players` in their places (`id`, `name`, `rank`,
+`outcome`, `racing`, `guesses`, `timeMs`, `tiles` without the Pokémon, and
+once it's over `comparisons` in full), `winner`, `answer` once it's over,
+and `game`, your own race as solo Wordle shows it. Times are the server's;
+`serverNow` gives the client its clock's offset.
+
+Close codes: 1012 the server is restarting (reconnect), 4000 the room has
+closed (don't), 4001 you're not in the room (join again, then reconnect).
+At most 5 messages a second (bursts of 10), 1 KB each; a client more than
+32 messages behind is disconnected, to reconnect for the latest.
 
 ## Testing
 

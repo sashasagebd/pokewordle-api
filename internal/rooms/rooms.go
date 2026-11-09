@@ -66,6 +66,22 @@ var (
 	ErrFinished   = errors.New("you've already finished this round")
 )
 
+var ruleErrors = []error{
+	ErrClosed, ErrFull, ErrNotMember, ErrNotHost, ErrInRound, ErrTooFew,
+	ErrNotReady, ErrNoRound, ErrNotStarted, ErrNotPlaying, ErrFinished,
+}
+
+// IsRuleError reports whether err is the rules refusing a change: the
+// player's mistake, with a message meant for them, rather than a failure.
+func IsRuleError(err error) bool {
+	for _, e := range ruleErrors {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // A Room is a lobby and its rounds.
 type Room struct {
 	ID   string
@@ -121,6 +137,7 @@ type Round struct {
 // A Player is a member's race in one round.
 type Player struct {
 	PlayerID string
+	Name     string // as a member when the round started
 	// GameID is the player's Wordle game for the round, filled in by the
 	// store.
 	GameID      string
@@ -344,7 +361,7 @@ func (r *Room) Start(player string, answerID int, now time.Time) error {
 	}
 	rd.EndsAt = rd.StartsAt.Add(RoundLength)
 	for i := range r.Members {
-		rd.Players = append(rd.Players, Player{PlayerID: r.Members[i].PlayerID})
+		rd.Players = append(rd.Players, Player{PlayerID: r.Members[i].PlayerID, Name: r.Members[i].Name})
 		r.Members[i].Ready = false // ready again for the one after
 	}
 	r.Round, r.Status = rd, Playing

@@ -3,6 +3,7 @@ module github.com/sashasagebd/pokewordle-api
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.13
 	github.com/jackc/pgx/v5 v5.11.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.24.0

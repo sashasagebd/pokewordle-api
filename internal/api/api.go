@@ -32,6 +32,10 @@ type Config struct {
 	// AllowedOrigins are the browser origins that may call the API (CORS),
 	// e.g. "https://pokewordle.sashasagebd.com".
 	AllowedOrigins []string
+	// Rooms and Sockets run Versus. Without Rooms, the room routes aren't
+	// served.
+	Rooms   Rooms
+	Sockets Sockets
 }
 
 // New returns the API's handler.
@@ -85,6 +89,7 @@ func New(c Config) http.Handler {
 
 	gameRoutes(mux, c)
 	accountRoutes(mux, c)
+	roomRoutes(mux, c)
 	// CORS outside the limits, so a browser can read a 429 too.
 	return cors(c.AllowedOrigins, newLimits().middleware(mux))
 }

@@ -20,11 +20,18 @@ type Store struct{ pool *pgxpool.Pool }
 // NewStore returns a Store using pool.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-// Load upserts ps into the pokemon table and returns how many rows changed.
-// Rows that already match are left alone, so it's cheap on every start, and
-// nothing is ever deleted (an older version may still be running beside this
-// one during a deploy). Both versions upsert in id order, so running at the
-// same time can't deadlock.
+// Load writes ps into the pokemon table and returns how many rows changed.
+// Nothing is ever deleted (an older version may still be running beside this
+// one during a deploy).
+//
+// Rows that already match are left alone, and not even locked: Load runs on
+// every start, while the version before is still playing games, and a move
+// locks the Pokémon its rounds refer to (their foreign keys). An upsert
+// (ON CONFLICT DO UPDATE ... WHERE changed) would lock every row it
+// conflicts with until the end, changed or not, and deadlock with a move
+// holding one Pokémon and wanting another. So new rows are inserted with
+// ON CONFLICT DO NOTHING, which doesn't lock, and changed ones updated with
+// a plain UPDATE, which locks only the rows it changes.
 func (s *Store) Load(ctx context.Context, ps []Pokemon) (changed int64, err error) {
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		batch := &pgx.Batch{}
@@ -32,22 +39,26 @@ func (s *Store) Load(ctx context.Context, ps []Pokemon) (changed int64, err erro
 			batch.Queue(`
 				INSERT INTO pokemon (id, name, generation, height, weight, types)
 				VALUES ($1, $2, $3, $4, $5, $6)
-				ON CONFLICT (id) DO UPDATE SET
-					name = EXCLUDED.name, generation = EXCLUDED.generation,
-					height = EXCLUDED.height, weight = EXCLUDED.weight, types = EXCLUDED.types
-				WHERE (pokemon.name, pokemon.generation, pokemon.height, pokemon.weight, pokemon.types)
-					IS DISTINCT FROM
-					(EXCLUDED.name, EXCLUDED.generation, EXCLUDED.height, EXCLUDED.weight, EXCLUDED.types)`,
+				ON CONFLICT (id) DO NOTHING`,
+				p.ID, p.Name, p.Generation, p.Height, p.Weight, p.Types)
+			batch.Queue(`
+				UPDATE pokemon SET name = $2, generation = $3, height = $4, weight = $5, types = $6
+				WHERE id = $1 AND (name, generation, height, weight, types)
+					IS DISTINCT FROM ($2::text, $3::smallint, $4::int, $5::int, $6::text[])`,
 				p.ID, p.Name, p.Generation, p.Height, p.Weight, p.Types)
 		}
 		results := tx.SendBatch(ctx, batch)
 		for _, p := range ps {
-			tag, err := results.Exec()
-			if err != nil {
-				results.Close()
-				return fmt.Errorf("#%d %s: %w", p.ID, p.Name, err)
+			// The insert, then the update: a new row counts once, as the
+			// update finds it matching.
+			for range 2 {
+				tag, err := results.Exec()
+				if err != nil {
+					results.Close()
+					return fmt.Errorf("#%d %s: %w", p.ID, p.Name, err)
+				}
+				changed += tag.RowsAffected()
 			}
-			changed += tag.RowsAffected()
 		}
 		return results.Close()
 	})
