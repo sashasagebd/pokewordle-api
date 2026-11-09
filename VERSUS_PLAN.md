@@ -16,7 +16,7 @@ Code paths are in this repo; phase 4 is in the frontend,
 - [x] **3. Sockets:** `/rooms` endpoints, `/ws`, a hub per instance (`internal/live`), `LISTEN`/`NOTIFY` between instances, closing with 1012 on shutdown
 - [x] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch (in `pokewordle`: `/versus`, `useRoom`)
 - [x] **5. Every mode:** Higher or Lower and Who's That in rooms too, as survival races over the same Pokémon ([below](#every-mode))
-- [ ] **6. Resilience:** prove it end to end: an instance stopped mid-round, its clients carrying on through the other; then a real deploy. (Grace, forfeits, expiry, 1012 on shutdown and reconnecting for the latest room are built.)
+- [ ] **6. Resilience:** a deploy, the database dropping `LISTEN`, deadlines with nobody connected and tabs on two instances, each staged in CI ([Testing](#testing)); `cmd/versuscheck` through a real deploy still to run
 - [ ] **7. Load and observability:** a bot load generator, per-room logs, latency numbers in the README
 - [ ] **Later:** a quick-match queue (it just pairs two players into a room), ping-compensated times, ratings
 
@@ -250,7 +250,27 @@ At most 5 messages a second (bursts of 10), 1 KB each; a client more than
 - **Sockets:** `httptest` with real `coder/websocket` clients playing whole
   rounds, **with the clients split across two API instances** on one
   database, so `LISTEN`/`NOTIFY` is what carries the game.
-- **Resilience:** stop an instance mid-round; its clients reconnect to the
-  other and the round finishes right. Then for real, during a deploy.
+- **Resilience** ([internal/live/resilience_test.go](internal/live/resilience_test.go)),
+  each failure staged for real against two instances, with clients from
+  [internal/versusclient](internal/versusclient/client.go) (it reconnects
+  as the frontend does):
+  - **A deploy:** the clients reach the instances through a stand-in for
+    the Cloudflare tunnel. Mid-round it switches to the second instance and
+    the first stops, closing its sockets with 1012. Both clients come back
+    through it to the second, the round carries on and finishes, and no
+    guess is lost or counted twice. Both end up connected, whatever order
+    the old version's disconnects and the new one's connects landed in.
+  - **The database dropping the hubs' `LISTEN` connections** (a restart, a
+    failover), with a change made before they're back: it still arrives
+    (each hub resends its rooms on reconnecting), and so do later ones.
+  - **Deadlines passing with nobody connected:** no hub has a timer for the
+    room, so the sweeper ends the round.
+  - **A player's tabs on two instances:** closing one records them as
+    disconnected; the instance with the other puts it right, and it stays
+    right.
+- **A real deploy:** [cmd/versuscheck](cmd/versuscheck/main.go) plays round
+  after round with two bots against the deployed API; deploy while it runs.
+  It reports moves never answered, unexpected errors and rooms going back a
+  version, and exits 1 if there were any.
 - **Load:** `cmd/bots` plays many rooms at once against a deployed API and
   reports guess-to-broadcast latency (p50, p99), for a table in the README.

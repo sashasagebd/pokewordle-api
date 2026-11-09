@@ -173,6 +173,22 @@ gofmt -l . && go vet ./... && go test ./...
 The database tests skip without `DATABASE_URL`; CI runs them against a real
 Postgres.
 
+## Checking a deploy
+
+[cmd/versuscheck](cmd/versuscheck/main.go) plays Versus against a running
+API with two bots, round after round, to see it through a deploy. Start it,
+deploy, and look at its report:
+
+```sh
+go run ./cmd/versuscheck -for 5m                       # the live API, Higher or Lower
+go run ./cmd/versuscheck -api http://localhost:8080 -mode wordle
+```
+
+Every 10 seconds it prints the rounds played, moves made and answered, and
+each bot's reconnects (a deploy causes one each). At the end it lists any
+problems, exiting 1 if there were: a move never answered, an unexpected
+error, a room going back to an older version, or a bot losing the room.
+
 ## Configuration
 
 | Variable | Default | What |
