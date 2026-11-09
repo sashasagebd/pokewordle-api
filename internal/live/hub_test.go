@@ -127,6 +127,10 @@ type client struct {
 	msgs chan msg
 	// closed gets the error the socket ended with.
 	closed chan error
+
+	mu     sync.Mutex
+	latest *live.View // the newest room seen
+	seq    int
 }
 
 func (in *instance) dial(t *testing.T, ticket string) *client {
@@ -139,7 +143,7 @@ func (in *instance) dial(t *testing.T, ticket string) *client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &client{t, conn, make(chan msg, 100), make(chan error, 1)}
+	c := &client{t: t, conn: conn, msgs: make(chan msg, 100), closed: make(chan error, 1)}
 	go func() {
 		for {
 			_, data, err := conn.Read(context.Background())
@@ -155,6 +159,13 @@ func (in *instance) dial(t *testing.T, ticket string) *client {
 				return
 			}
 			m.raw = string(data)
+			if m.Type == "room" {
+				c.mu.Lock()
+				if m.Seq > c.seq {
+					c.seq, c.latest = m.Seq, &m.Room
+				}
+				c.mu.Unlock()
+			}
 			c.msgs <- m
 		}
 	}()
@@ -195,8 +206,19 @@ func (c *client) await(what string, ok func(msg) bool) msg {
 }
 
 // awaitRoom returns the first room view that ok accepts.
+// awaitRoom returns the room once ok accepts it: the newest seen, if it does
+// already, or the next that does. Checking the newest first matters: a
+// change may arrive in the very message an earlier wait took (Bob connecting
+// before Alice's first view is sent: that view shows him connected), and
+// nothing more may come.
 func (c *client) awaitRoom(what string, ok func(live.View) bool) live.View {
 	c.t.Helper()
+	c.mu.Lock()
+	latest := c.latest
+	c.mu.Unlock()
+	if latest != nil && ok(*latest) {
+		return *latest
+	}
 	return c.await(what, func(m msg) bool { return m.Type == "room" && ok(m.Room) }).Room
 }
 
