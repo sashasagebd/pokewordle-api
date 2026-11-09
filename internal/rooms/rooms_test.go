@@ -586,3 +586,37 @@ func TestSettings(t *testing.T) {
 		t.Errorf("mode %s, b ready %v after no change", r.Mode, m.Ready)
 	}
 }
+
+func TestAQuickRoomStartsByItself(t *testing.T) {
+	r := New("room", "K7QX2M", "a", "Ash", games.AllGens, t0)
+	r.Quick = true
+	must(t, r.Join("b", "B", t0))
+	if r.QuickReady() {
+		t.Fatal("ready with nobody connected")
+	}
+	wantErr(t, r.StartQuick(answer, t0), ErrNotReady)
+	must(t, r.Connect("a", t0))
+	if r.QuickReady() {
+		t.Fatal("ready with b not connected")
+	}
+	// Nobody readied: queuing was enough.
+	must(t, r.Connect("b", at(time.Second)))
+	if !r.QuickReady() {
+		t.Fatal("not ready with both connected")
+	}
+	must(t, r.StartQuick(answer, at(time.Second)))
+	if r.Status != Playing || r.Round.N != 1 || len(r.Round.Players) != 2 {
+		t.Fatalf("after StartQuick: %s, %+v", r.Status, r.Round)
+	}
+
+	// Only the first round: after it, it's an ordinary lobby.
+	must(t, r.Forfeit("b", at(Countdown+2*time.Second)))
+	if r.Status != Lobby || r.QuickReady() {
+		t.Errorf("after the first round: %s, quick-ready %v", r.Status, r.QuickReady())
+	}
+	// And an ordinary room never starts itself.
+	plain := lobby(t, "b")
+	if plain.QuickReady() {
+		t.Error("an ordinary room is quick-ready")
+	}
+}

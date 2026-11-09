@@ -68,46 +68,49 @@ func (s *Store) intn(n int) int {
 	return mrand.IntN(n)
 }
 
-var errCodeTaken = errors.New("room code taken")
-
 // Create makes a room with player as host, in the lobby.
 func (s *Store) Create(ctx context.Context, player string, mask games.GenMask) (*Room, error) {
+	var room *Room
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		now, err := clock(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if room, err = s.createIn(ctx, tx, player, mask, now); err != nil {
+			return err
+		}
+		return save(ctx, tx, room)
+	})
+	if err == nil {
+		slog.Info("room made", "room", room.Code)
+	}
+	return room, err
+}
+
+// createIn makes a room's row in tx, with host in it, and returns the room,
+// for the caller to change and save.
+func (s *Store) createIn(ctx context.Context, tx pgx.Tx, host string, mask games.GenMask, now time.Time) (*Room, error) {
+	name, err := nameOf(ctx, tx, host)
+	if err != nil {
+		return nil, err
+	}
 	// A taken code is retried with another. With hundreds of millions of
 	// codes and rooms deleted after a day, a second try is already rare.
 	for range 5 {
 		code := NewCode(s.intn)
-		var room *Room
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			now, err := clock(ctx, tx)
-			if err != nil {
-				return err
-			}
-			name, err := nameOf(ctx, tx, player)
-			if err != nil {
-				return err
-			}
-			var id string
-			err = tx.QueryRow(ctx, `
-				INSERT INTO rooms (code, host_id, gen_mask, status, last_activity_at)
-				VALUES ($1, $2::uuid, $3, 'lobby', $4)
-				ON CONFLICT (code) DO NOTHING
-				RETURNING id::text`, code, player, int16(mask), now).Scan(&id)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return errCodeTaken
-			}
-			if err != nil {
-				return err
-			}
-			room = New(id, code, player, name, mask, now)
-			return save(ctx, tx, room)
-		})
-		if errors.Is(err, errCodeTaken) {
+		var id string
+		err := tx.QueryRow(ctx, `
+			INSERT INTO rooms (code, host_id, gen_mask, status, last_activity_at)
+			VALUES ($1, $2::uuid, $3, 'lobby', $4)
+			ON CONFLICT (code) DO NOTHING
+			RETURNING id::text`, code, host, int16(mask), now).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
 			continue
 		}
-		if err == nil {
-			slog.Info("room made", "room", room.Code)
+		if err != nil {
+			return nil, err
 		}
-		return room, err
+		return New(id, code, host, name, mask, now), nil
 	}
 	return nil, errors.New("no free room code in 5 tries")
 }
@@ -157,9 +160,19 @@ func (s *Store) Leave(ctx context.Context, player, id string) (*Room, error) {
 	return s.simple(ctx, id, func(r *Room, now time.Time) error { return r.Leave(player, now) })
 }
 
-// Connect records that player's socket to room id opened.
+// Connect records that player's socket to room id opened. In a quick-match
+// room, the last of its players connecting starts its first round.
 func (s *Store) Connect(ctx context.Context, player, id string) (*Room, error) {
-	return s.simple(ctx, id, func(r *Room, now time.Time) error { return r.Connect(player, now) })
+	room, _, err := s.change(ctx, id, func(tx pgx.Tx, r *Room, now time.Time) (bool, error) {
+		if err := r.Connect(player, now); err != nil {
+			return false, err
+		}
+		if r.QuickReady() {
+			return true, s.startIn(ctx, tx, r, func(answerID int) error { return r.StartQuick(answerID, now) })
+		}
+		return true, nil
+	})
+	return room, err
 }
 
 // Disconnect records that player's last socket to room id closed.
@@ -202,34 +215,41 @@ func (s *Store) Tick(ctx context.Context, id string) (*Room, bool, error) {
 // so they all meet the same ones.
 func (s *Store) Start(ctx context.Context, player, id string) (*Room, error) {
 	room, _, err := s.change(ctx, id, func(tx pgx.Tx, r *Room, now time.Time) (bool, error) {
-		seed := mrand.Int64N(math.MaxInt64) + 1 // 0 means unseeded
-		if err := r.Start(player, s.games.FirstAnswer(r.Mode, r.Mask, seed), now); err != nil {
-			return false, err
-		}
-		rd := r.Round
-		rd.Seed = seed
-		if err := tx.QueryRow(ctx, `
-			INSERT INTO room_rounds (room_id, n, mode, seed, answer_id, starts_at, ends_at)
-			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7) RETURNING id::text`,
-			r.ID, rd.N, rd.Mode, rd.Seed, rd.AnswerID, rd.StartsAt, rd.EndsAt).Scan(&rd.ID); err != nil {
-			return false, err
-		}
-		for i := range rd.Players {
-			p := &rd.Players[i]
-			gameID, err := s.games.StartInRound(ctx, tx, p.PlayerID, rd.ID, rd.Mode, r.Mask, rd.Seed)
-			if err != nil {
-				return false, err
-			}
-			p.GameID = gameID
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO room_round_players (round_id, player_id, position, name, game_id)
-				VALUES ($1::uuid, $2::uuid, $3, $4, $5::uuid)`, rd.ID, p.PlayerID, i, p.Name, gameID); err != nil {
-				return false, err
-			}
-		}
-		return true, nil
+		return true, s.startIn(ctx, tx, r, func(answerID int) error { return r.Start(player, answerID, now) })
 	})
 	return room, err
+}
+
+// startIn starts a round in r with start (the rules' Start, or StartQuick),
+// given the first answer from a new seed, and makes its rows and every
+// player's game in tx.
+func (s *Store) startIn(ctx context.Context, tx pgx.Tx, r *Room, start func(answerID int) error) error {
+	seed := mrand.Int64N(math.MaxInt64) + 1 // 0 means unseeded
+	if err := start(s.games.FirstAnswer(r.Mode, r.Mask, seed)); err != nil {
+		return err
+	}
+	rd := r.Round
+	rd.Seed = seed
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO room_rounds (room_id, n, mode, seed, answer_id, starts_at, ends_at)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7) RETURNING id::text`,
+		r.ID, rd.N, rd.Mode, rd.Seed, rd.AnswerID, rd.StartsAt, rd.EndsAt).Scan(&rd.ID); err != nil {
+		return err
+	}
+	for i := range rd.Players {
+		p := &rd.Players[i]
+		gameID, err := s.games.StartInRound(ctx, tx, p.PlayerID, rd.ID, rd.Mode, r.Mask, rd.Seed)
+		if err != nil {
+			return err
+		}
+		p.GameID = gameID
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO room_round_players (round_id, player_id, position, name, game_id)
+			VALUES ($1::uuid, $2::uuid, $3, $4, $5::uuid)`, rd.ID, p.PlayerID, i, p.Name, gameID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // A GuessResult is a Versus guess as its player sees it: the same as a solo
@@ -427,14 +447,14 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 	if !uuidPattern.MatchString(id) {
 		return nil, ErrNotFound
 	}
-	q := `SELECT id::text, code, coalesce(host_id::text, ''), mode, gen_mask, status, last_activity_at, seq
+	q := `SELECT id::text, code, coalesce(host_id::text, ''), mode, gen_mask, status, last_activity_at, seq, quick
 		FROM rooms WHERE id = $1::uuid`
 	if lock {
 		q += ` FOR UPDATE`
 	}
 	r := &Room{}
 	var mask int16
-	err := tx.QueryRow(ctx, q, id).Scan(&r.ID, &r.Code, &r.Host, &r.Mode, &mask, &r.Status, &r.LastActivity, &r.Seq)
+	err := tx.QueryRow(ctx, q, id).Scan(&r.ID, &r.Code, &r.Host, &r.Mode, &mask, &r.Status, &r.LastActivity, &r.Seq, &r.Quick)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -513,9 +533,9 @@ func load(ctx context.Context, tx pgx.Tx, id string, lock bool) (*Room, error) {
 func save(ctx context.Context, tx pgx.Tx, r *Room) error {
 	if err := tx.QueryRow(ctx, `
 		UPDATE rooms SET host_id = nullif($2, '')::uuid, mode = $3, gen_mask = $4, status = $5,
-			last_activity_at = $6, seq = seq + 1
+			last_activity_at = $6, quick = $7, seq = seq + 1
 		WHERE id = $1::uuid RETURNING seq`,
-		r.ID, r.Host, r.Mode, int16(r.Mask), r.Status, r.LastActivity).Scan(&r.Seq); err != nil {
+		r.ID, r.Host, r.Mode, int16(r.Mask), r.Status, r.LastActivity, r.Quick).Scan(&r.Seq); err != nil {
 		return err
 	}
 

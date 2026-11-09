@@ -55,6 +55,7 @@ type Result struct {
 	SessionsExpired int64
 	RoomsDeleted    int64
 	TicketsExpired  int64
+	QueueExpired    int64 // quick-match waits and matches given up on
 }
 
 // Run runs Once after firstDelay, then every interval, until ctx ends.
@@ -74,7 +75,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config, firstDelay, interv
 		case err == nil && !res.Skipped:
 			slog.Info("cleanup done", "games_abandoned", res.GamesAbandoned,
 				"guests_deleted", res.GuestsDeleted, "sessions_expired", res.SessionsExpired,
-				"rooms_deleted", res.RoomsDeleted, "tickets_expired", res.TicketsExpired)
+				"rooms_deleted", res.RoomsDeleted, "tickets_expired", res.TicketsExpired,
+				"queue_expired", res.QueueExpired)
 		}
 		timer.Reset(interval)
 	}
@@ -174,5 +176,25 @@ func Once(ctx context.Context, pool *pgxpool.Pool, cfg Config) (res Result, err 
 			LIMIT $2)`, 0); err != nil {
 		return res, fmt.Errorf("expiring socket tickets: %w", err)
 	}
+
+	// Quick match: waits not asked about again, and matches not picked up,
+	// for a minute (they count as gone well before: rooms.QueueTTL).
+	waits, err := batches(`
+		DELETE FROM match_queue WHERE player_id IN (
+			SELECT player_id FROM match_queue
+			WHERE last_seen_at < now() - $1::float8 * interval '1 second'
+			LIMIT $2)`, time.Minute)
+	if err != nil {
+		return res, fmt.Errorf("expiring quick-match waits: %w", err)
+	}
+	found, err := batches(`
+		DELETE FROM match_found WHERE player_id IN (
+			SELECT player_id FROM match_found
+			WHERE found_at < now() - $1::float8 * interval '1 second'
+			LIMIT $2)`, time.Minute)
+	if err != nil {
+		return res, fmt.Errorf("expiring quick matches: %w", err)
+	}
+	res.QueueExpired = waits + found
 	return res, nil
 }

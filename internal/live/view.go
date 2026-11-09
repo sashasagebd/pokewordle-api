@@ -30,10 +30,13 @@ func PublicID(roomID, player string) string {
 
 // A View is a room as one member may see it.
 type View struct {
-	Code    string       `json:"code"`
-	Status  rooms.Status `json:"status"`
-	Mode    games.Mode   `json:"mode"` // the next round's
-	Gens    []int        `json:"gens"`
+	Code   string       `json:"code"`
+	Status rooms.Status `json:"status"`
+	Mode   games.Mode   `json:"mode"` // the next round's
+	Gens   []int        `json:"gens"`
+	// Quick is a quick-match room: its first round starts by itself once
+	// both players are connected.
+	Quick   bool         `json:"quick"`
 	You     string       `json:"you"`  // your public ID
 	Host    string       `json:"host"` // the host's
 	Members []MemberView `json:"members"`
@@ -108,7 +111,7 @@ type Tile struct {
 // by player ID (one missing just shows no guesses).
 func ViewFor(r *rooms.Room, states map[string]games.State, player string) View {
 	v := View{
-		Code: r.Code, Status: r.Status, Mode: r.Mode, Gens: r.Mask.Gens(),
+		Code: r.Code, Status: r.Status, Mode: r.Mode, Gens: r.Mask.Gens(), Quick: r.Quick,
 		You: PublicID(r.ID, player), Members: []MemberView{},
 	}
 	if r.Host != "" {
