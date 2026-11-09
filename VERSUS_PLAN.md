@@ -12,7 +12,7 @@ Code paths are in this repo; phase 4 is in the frontend,
 ## Status
 
 - [x] **1. Rules:** `internal/rooms`, the pure rules of a room (no database, no clock), with tests
-- [ ] **2. Store:** migration, `rooms.Store`, socket tickets, solo games ignoring room games
+- [x] **2. Store:** migration, `rooms.Store`, socket tickets, solo games ignoring room games, cleanup
 - [ ] **3. Sockets:** `/ws`, a hub per instance, `LISTEN`/`NOTIFY` between instances
 - [ ] **4. Frontend:** create or join by code, lobby, countdown, race, results, rematch
 - [ ] **5. Resilience:** resume with a snapshot, grace and forfeit, closing sockets on shutdown, room expiry
@@ -111,62 +111,29 @@ on the same moment. Times are credited when the server receives the guess.
 Ping-compensated credit (receive time minus half the measured round trip,
 capped at 150 ms so faking lag doesn't pay) can come later.
 
-## Schema (`0005_rooms.sql`, additions only)
+## Schema
 
-```sql
-CREATE TABLE rooms (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  code text NOT NULL UNIQUE,
-  host_id uuid REFERENCES players ON DELETE SET NULL,
-  gen_mask smallint NOT NULL CHECK (gen_mask BETWEEN 1 AND 511),
-  status text NOT NULL CHECK (status IN ('lobby', 'playing', 'closed')),
-  seq integer NOT NULL DEFAULT 0,  -- bumped on every change, for resume
-  last_activity_at timestamptz NOT NULL DEFAULT now(),
-  created_at timestamptz NOT NULL DEFAULT now());
+[internal/db/migrations/0005_rooms.sql](internal/db/migrations/0005_rooms.sql)
+adds `rooms`, `room_members`, `room_rounds`, `room_round_players` (each
+player's race: their game, guesses, when they solved it or forfeited) and
+`ws_tickets`, and `games.room_round_id`, marking a game as a Versus race.
 
-CREATE TABLE room_members (
-  room_id uuid REFERENCES rooms ON DELETE CASCADE,
-  player_id uuid REFERENCES players ON DELETE CASCADE,
-  name text NOT NULL,  -- the username, or "Guest 1234"
-  ready boolean NOT NULL DEFAULT false,
-  joined_at timestamptz NOT NULL DEFAULT now(),
-  disconnected_at timestamptz DEFAULT now(),
-  PRIMARY KEY (room_id, player_id));
-
-CREATE TABLE room_rounds (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  room_id uuid NOT NULL REFERENCES rooms ON DELETE CASCADE,
-  n integer NOT NULL,
-  answer_id integer NOT NULL REFERENCES pokemon,
-  starts_at timestamptz NOT NULL, ends_at timestamptz NOT NULL,
-  finished_at timestamptz,
-  UNIQUE (room_id, n));
-
-CREATE TABLE room_round_players (
-  round_id uuid REFERENCES room_rounds ON DELETE CASCADE,
-  player_id uuid REFERENCES players ON DELETE CASCADE,
-  game_id uuid NOT NULL REFERENCES games ON DELETE CASCADE,
-  guesses integer NOT NULL DEFAULT 0,
-  solved_at timestamptz, forfeited_at timestamptz,
-  PRIMARY KEY (round_id, player_id));
-
-CREATE TABLE ws_tickets (
-  hash bytea PRIMARY KEY CHECK (length(hash) = 32),
-  player_id uuid NOT NULL REFERENCES players ON DELETE CASCADE,
-  room_id uuid NOT NULL REFERENCES rooms ON DELETE CASCADE,
-  expires_at timestamptz NOT NULL);
-
-ALTER TABLE games ADD COLUMN room_round_id uuid REFERENCES room_rounds ON DELETE SET NULL;
-```
-
-- `Store.Start`'s "abandon your other active Wordle game" must skip room
-  games (`AND room_round_id IS NULL`), and `improvesBest` must skip them
-  too. During a deploy the old version doesn't know the column, so starting
-  a solo Wordle there would abandon a room game in progress. Short-lived
-  and harmless enough, but worth knowing.
-- Cleanup: rooms idle for 30 minutes close (the rules decide; the sweeper
-  applies it), closed rooms are deleted after a day, expired tickets
-  hourly.
+- A room game is only played through its room: the solo endpoints answer
+  409 for one, `POST /games` doesn't abandon one, and none counts toward
+  best scores. When a round ends, the games of those who didn't solve it
+  end as lost, which reveals the answer.
+- During a deploy the old version doesn't know `room_round_id`, so starting
+  a solo Wordle there would abandon a room game in progress. Short-lived and
+  harmless enough, but worth knowing.
+- Every change to a room is one transaction with its row locked, timed by
+  `clock_timestamp()` once the lock is held (not `now()`, the transaction's
+  start: a guess that waited for the lock would be timed before the change
+  it waited for). A move the rules refuse is undone with a savepoint, but
+  deadlines that had passed are still saved.
+- Cleanup deletes rooms idle for a day (with their rounds and games) and
+  expired tickets.
+- Logging a guest in to an account moves their games, but their place in a
+  room is lost with the guest: they join again.
 
 ## API
 

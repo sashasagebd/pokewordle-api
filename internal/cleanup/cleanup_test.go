@@ -12,6 +12,7 @@ import (
 	"github.com/sashasagebd/pokewordle-api/internal/dbtest"
 	"github.com/sashasagebd/pokewordle-api/internal/games"
 	"github.com/sashasagebd/pokewordle-api/internal/pokedex"
+	"github.com/sashasagebd/pokewordle-api/internal/rooms"
 )
 
 type fixture struct {
@@ -145,6 +146,46 @@ func TestCleanup(t *testing.T) {
 	again, err := Once(f.ctx, f.pool, cfg)
 	if err != nil || again.Skipped || again.GuestsDeleted+again.GamesAbandoned+again.SessionsExpired != 0 {
 		t.Errorf("second run = %+v, %v; want a run that changes nothing", again, err)
+	}
+}
+
+func TestCleanupRooms(t *testing.T) {
+	f := setup(t)
+	store := rooms.NewStore(f.pool, f.games)
+	host := f.player(true, "0 days", "0 days")
+
+	idle, err := store.Create(f.ctx, host, games.AllGens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE rooms SET last_activity_at = now() - interval '25 hours' WHERE id = $1::uuid`, idle.ID)
+	fresh, err := store.Create(f.ctx, host, games.AllGens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Ticket(f.ctx, host, fresh.Code); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE ws_tickets SET expires_at = now() - interval '1 minute' WHERE room_id = $1::uuid`, fresh.ID)
+
+	res, err := Once(f.ctx, f.pool, Defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RoomsDeleted < 1 || res.TicketsExpired < 1 {
+		t.Errorf("result = %+v, want a room deleted and a ticket expired", res)
+	}
+	if n := f.count(`SELECT count(*) FROM rooms WHERE id = $1::uuid`, idle.ID); n != 0 {
+		t.Error("a room idle for 25 hours is still there")
+	}
+	if n := f.count(`SELECT count(*) FROM room_members WHERE room_id = $1::uuid`, idle.ID); n != 0 {
+		t.Error("the deleted room left its members")
+	}
+	if n := f.count(`SELECT count(*) FROM rooms WHERE id = $1::uuid`, fresh.ID); n != 1 {
+		t.Error("a room just made was deleted")
+	}
+	if n := f.count(`SELECT count(*) FROM ws_tickets WHERE room_id = $1::uuid`, fresh.ID); n != 0 {
+		t.Error("an expired ticket is still there")
 	}
 }
 

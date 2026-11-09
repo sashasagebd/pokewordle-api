@@ -47,6 +47,7 @@ var (
 	ErrNotFound   = errors.New("no such game")
 	ErrOver       = errors.New("this game is over")
 	ErrWrongRound = errors.New("that round has already been answered")
+	ErrRoomGame   = errors.New("this game is played in its Versus room")
 )
 
 // An InputError is a move the game can't take, like an unknown Pokémon. Its
@@ -67,6 +68,10 @@ type Game struct {
 	// Score: the number of guesses in Wordle, the streak in the others.
 	Score  int
 	Rounds []Round // Rounds[i].N == i+1
+	// RoomRound is the Versus round this game is a player's race in, or ""
+	// for a solo game. A room game is only played through its room, and
+	// never counts toward best scores.
+	RoomRound string
 }
 
 // A Round is one thing to answer.
@@ -147,6 +152,10 @@ func (e *Engine) New(mode Mode, mask GenMask) *Game {
 	}
 	return g
 }
+
+// Pick returns a random Pokémon from m's generations: a Versus round's
+// answer, the same for everyone in it.
+func (e *Engine) Pick(m GenMask) int { return e.Dex.random(m, e.intn) }
 
 // addRound adds the next streak round. It never repeats the Pokémon just
 // before it.

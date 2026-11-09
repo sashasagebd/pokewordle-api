@@ -1,6 +1,6 @@
 // Package cleanup tidies the database in the background: it abandons games
-// left idle, deletes guests nobody has used in a while, and expires logins
-// unused for a year.
+// left idle, deletes guests nobody has used in a while, expires logins unused
+// for a year, and deletes Versus rooms left idle and expired socket tickets.
 //
 // It runs in every instance of the app, but takes a Postgres advisory lock
 // first, so when two versions overlap (a deploy) only one does the work.
@@ -29,6 +29,10 @@ type Config struct {
 	// SessionTTL: a session unused this long is deleted (its player logs in
 	// again).
 	SessionTTL time.Duration
+	// RoomTTL: a Versus room with no activity for this long is deleted, with
+	// its rounds and their games. (The rules close a room idle for half an
+	// hour; this tidies it away.)
+	RoomTTL time.Duration
 	// Batch is how many rows each statement changes at most, so none holds
 	// locks for long.
 	Batch int
@@ -39,6 +43,7 @@ var Defaults = Config{
 	IdleGame:   24 * time.Hour,
 	GuestTTL:   30 * 24 * time.Hour,
 	SessionTTL: 365 * 24 * time.Hour,
+	RoomTTL:    24 * time.Hour,
 	Batch:      1000,
 }
 
@@ -48,6 +53,8 @@ type Result struct {
 	GamesAbandoned  int64
 	GuestsDeleted   int64
 	SessionsExpired int64
+	RoomsDeleted    int64
+	TicketsExpired  int64
 }
 
 // Run runs Once after firstDelay, then every interval, until ctx ends.
@@ -66,7 +73,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config, firstDelay, interv
 			slog.Error("cleanup failed", "err", err)
 		case err == nil && !res.Skipped:
 			slog.Info("cleanup done", "games_abandoned", res.GamesAbandoned,
-				"guests_deleted", res.GuestsDeleted, "sessions_expired", res.SessionsExpired)
+				"guests_deleted", res.GuestsDeleted, "sessions_expired", res.SessionsExpired,
+				"rooms_deleted", res.RoomsDeleted, "tickets_expired", res.TicketsExpired)
 		}
 		timer.Reset(interval)
 	}
@@ -147,6 +155,24 @@ func Once(ctx context.Context, pool *pgxpool.Pool, cfg Config) (res Result, err 
 					WHERE s.player_id = p.id AND s.last_used_at >= now() - $1::float8 * interval '1 second')
 			LIMIT $2)`, cfg.GuestTTL); err != nil {
 		return res, fmt.Errorf("deleting stale guests: %w", err)
+	}
+
+	// The cascades take the room's members, rounds, their games and tickets.
+	if res.RoomsDeleted, err = batches(`
+		DELETE FROM rooms WHERE id IN (
+			SELECT id FROM rooms
+			WHERE last_activity_at < now() - $1::float8 * interval '1 second'
+			LIMIT $2)`, cfg.RoomTTL); err != nil {
+		return res, fmt.Errorf("deleting idle rooms: %w", err)
+	}
+
+	// A ticket lasts seconds; expired ones are only kept until now.
+	if res.TicketsExpired, err = batches(`
+		DELETE FROM ws_tickets WHERE hash IN (
+			SELECT hash FROM ws_tickets
+			WHERE expires_at < now() - $1::float8 * interval '1 second'
+			LIMIT $2)`, 0); err != nil {
+		return res, fmt.Errorf("expiring socket tickets: %w", err)
 	}
 	return res, nil
 }
